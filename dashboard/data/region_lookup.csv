@@ -1,0 +1,6 @@
+regionid,region_short,region_long,sort_order
+SA1,SA,South Australia,0
+VIC1,VIC,Victoria,1
+NSW1,NSW,New South Wales,2
+QLD1,QLD,Queensland,3
+TAS1,TAS,Tasmania,4

@@ -1,0 +1,89 @@
+{
+    "name": "NEM Reversal Theme",
+    "dataColors": [
+        "#E45756",
+        "#4C78A8",
+        "#54A24B",
+        "#F2A93B",
+        "#9D9D9D",
+        "#B07AA1",
+        "#76B7B2",
+        "#FF9DA7"
+    ],
+    "background": "#FFFFFF",
+    "foreground": "#1F1F1F",
+    "tableAccent": "#4C78A8",
+    "good": "#54A24B",
+    "neutral": "#9D9D9D",
+    "bad": "#E45756",
+    "maximum": "#1F77B4",
+    "center": "#FFFFFF",
+    "minimum": "#E45756",
+    "null": "#9D9D9D",
+    "textClasses": {
+        "title": {
+            "fontFace": "Segoe UI Semibold",
+            "fontSize": 16,
+            "color": "#1F1F1F"
+        },
+        "header": {
+            "fontFace": "Segoe UI Semibold",
+            "fontSize": 12,
+            "color": "#1F1F1F"
+        },
+        "label": {
+            "fontFace": "Segoe UI",
+            "fontSize": 10,
+            "color": "#1F1F1F"
+        },
+        "callout": {
+            "fontFace": "Segoe UI Semibold",
+            "fontSize": 24,
+            "color": "#1F1F1F"
+        }
+    },
+    "visualStyles": {
+        "*": {
+            "*": {
+                "background": [
+                    {
+                        "show": true,
+                        "color": {"solid": {"color": "#FFFFFF"}},
+                        "transparency": 0
+                    }
+                ],
+                "border": [
+                    {
+                        "show": false
+                    }
+                ],
+                "visualHeader": [
+                    {
+                        "show": false
+                    }
+                ]
+            }
+        },
+        "page": {
+            "*": {
+                "background": [
+                    {
+                        "color": {"solid": {"color": "#F5F5F5"}},
+                        "transparency": 0
+                    }
+                ]
+            }
+        },
+        "lineChart": {
+            "*": {
+                "lineStyles": [
+                    {
+                        "strokeWidth": 2,
+                        "showMarker": true,
+                        "markerSize": 4
+                    }
+                ]
+            }
+        }
+    }
+}
