@@ -1,0 +1,27 @@
+# Secrets
+.env
+
+# Data — too large for git, regenerable from nemosis / Open-Meteo
+data/raw/
+data/parquet/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS / editor scratch
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+*.swp
+~$*
+
+# Private planning docs
+docs/PHASE2_PLAN.md

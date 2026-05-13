@@ -1,0 +1,42 @@
+name: nem_demand
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+
+  # core data
+  - pandas>=2.0
+  - numpy
+  - pyarrow>=14         # parquet I/O
+  - scipy
+
+  # stats / ML
+  - statsmodels         # OLS in 01_descriptive (H6 panel slope test)
+  - scikit-learn        # LR + RF for 02_reversal_classifier (Sub-Q3)
+
+  # plotting
+  - matplotlib
+  - seaborn
+
+  # notebook
+  - jupyterlab
+  - ipykernel
+  - ipywidgets          # jupysql autocomplete / table preview dependency
+
+  # db
+  - psycopg2-binary     # postgres driver (low-level, used for COPY FROM bulk load)
+  - sqlalchemy>=2.0     # engine layer; required by pandas read_sql / to_sql
+  - duckdb              # ad-hoc parquet query (lets us skip postgres during exploration)
+
+  # utils
+  - python-dotenv       # config / secrets
+  - requests            # Open-Meteo + ad-hoc HTTP fetches
+  - tqdm                # progress bars
+
+  - pip
+  - pip:
+    - nemosis>=3.8      # AEMO MMSDM downloader (PyPI only, no conda channel)
+    - boto3             # S3 raw backup (incidental in Phase 1, primary in Phase 2)
+    - jupysql           # %%sql cell magic in notebooks
+    - sqlalchemy-utils  # jupysql dependency for connection health checks
+    - holidays>=0.50    # AU public-holiday flags for ML feature engineering
