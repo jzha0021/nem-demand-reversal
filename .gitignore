@@ -5,6 +5,9 @@
 data/raw/
 data/parquet/
 
+# ML artefacts — regenerable from notebooks/02_reversal_classifier.ipynb
+models/*.joblib
+
 # Python
 __pycache__/
 *.pyc

@@ -3,7 +3,8 @@
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14-336791)
 ![Power BI](https://img.shields.io/badge/Power%20BI-Dashboard-F2C811)
-![Status](https://img.shields.io/badge/Status-Complete-brightgreen)
+![Status](https://img.shields.io/badge/Phase%201-Complete-brightgreen)
+![Status](https://img.shields.io/badge/Phase%202-Partial%20(A%20%2B%20B)-yellow)
 
 Quantifying how rooftop solar has flipped the NEM from max-demand-constrained to **min-demand-constrained** across all 5 regions over 44 months.
 
@@ -115,6 +116,24 @@ Page 2 is a methodology + ML walkthrough — the Finding 4 partial-residual scat
 
 ---
 
+## Phase 2 — Operationalisation (in progress)
+
+Phase 1 above is the frozen retrospective analysis. Phase 2 turns it into a forward-running daily inference loop — same model, same features, but consuming near-realtime NEMWeb data instead of MMSDM monthly archives.
+
+**Delivered (workstreams A + B):**
+
+- **`pipeline/predict.py`** — CLI inference (`python pipeline/predict.py --date YYYY-MM-DD`) that loads the Phase 1 leak-free LR pipeline from a joblib artefact and writes `P(D reversal)` to a Postgres `analytics.predictions` log. Replicates the notebook feature derivation (holiday flag, `time_idx`, lag-7 rooftop P95, semi-scheduled share) so the production output is bit-identical to the notebook's `predict_proba`.
+- **`pipeline/smoke_test_predict.py`** — replays the full NB02 test window through `predict.py` and asserts the realised AUC matches the artefact's pickled `test_auc` to within 1e-6. Currently passing with `gap = 0.00e+00`.
+- **`pipeline/fetch_aemo_current.py` + `pipeline/fetch_rooftop_current.py`** — NEMWeb CURRENT scrapers for daily incremental ingestion. The original Phase 2 plan assumed nemosis would route CURRENT URLs transparently for these tables — [it doesn't](docs/NEMWEB_CURRENT_SCHEMA_DIFF.md), so a custom scraper was needed. Both are idempotent via `ON CONFLICT DO NOTHING` on the existing primary keys; no schema migrations required.
+- **`db/03_predictions_schema.sql`** — `analytics.predictions` table (PK lets multiple `model_version`s coexist for A/B) + `v_prediction_vs_actual` reconciliation view.
+- **End-to-end verification** — predictions for 2026-05-13 and 2026-05-14 (the first dates produced from CURRENT data alone) both correctly flagged reversal=1 with high probability (P=0.89, 0.77); `hit=t` in the reconciliation view.
+
+**Deferred (workstreams C + D + E):**
+
+GitHub Actions cron, AWS S3 raw backup, Snowflake + dbt port, and the public Streamlit dashboard are scoped but not yet executed. Decision context, restart checklist, and known issues are documented in [`docs/PHASE2_STATUS.md`](docs/PHASE2_STATUS.md). The pause is deliberate — Phase 2 A + B is the technical substance most relevant to a Junior DA portfolio; C + D + E target an Analytics Engineer / Senior DA audience and can resume when needed.
+
+---
+
 ## Methodology
 
 Full pre-registered hypotheses, thresholds, and verdicts in [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md).
@@ -161,11 +180,12 @@ Source license + attribution detail in [`docs/DATA_SOURCES.md`](docs/DATA_SOURCE
 
 ## Tech Stack
 
-- **Pipeline:** Python, pandas, nemosis (AEMO archive client), requests (Open-Meteo), SQLAlchemy
+- **Pipeline:** Python, pandas, nemosis (AEMO MMSDM archive), requests + BeautifulSoup (NEMWeb CURRENT scrape), SQLAlchemy
 - **Database:** PostgreSQL 14
 - **Analysis:** numpy, pandas, statsmodels (OLS + Newey-West HAC), scipy (Fisher, chi-square), scikit-learn (LR / RF / permutation importance), holidays
+- **Inference (Phase 2):** joblib model artefact + CLI inference; `psycopg2.extras.execute_values` for `ON CONFLICT DO NOTHING` upserts
 - **Dashboard:** Power BI Desktop, custom theme JSON
-- **Sources:** [AEMO MMSDM](https://aemo.com.au/), [Open-Meteo Archive](https://open-meteo.com/), [`holidays`](https://pypi.org/project/holidays/) Python package
+- **Sources:** [AEMO MMSDM](https://aemo.com.au/) (historical) + [NEMWeb CURRENT](https://nemweb.com.au/Reports/Current/) (Phase 2 realtime), [Open-Meteo Archive](https://open-meteo.com/), [`holidays`](https://pypi.org/project/holidays/) Python package
 
 ---
 
@@ -174,17 +194,23 @@ Source license + attribution detail in [`docs/DATA_SOURCES.md`](docs/DATA_SOURCE
 ```
 nem_negative_pricing/
 ├── pipeline/
-│   ├── _common.py              # KEEP_COLS / REVERSAL_HOURS / interval-START helper
-│   ├── fetch_aemo.py           # Dispatch MMSDM fetcher (idempotent, monthly chunked)
+│   ├── _common.py              # KEEP_COLS / REVERSAL_HOURS + MMS parser / NaN→NULL helpers
+│   ├── fetch_aemo.py           # Dispatch MMSDM fetcher (Phase 1; idempotent, monthly chunked)
 │   ├── load_to_postgres.py     # Dispatch parquet → Postgres COPY
-│   ├── fetch_rooftop.py        # ROOFTOP_PV_ACTUAL fetcher
+│   ├── fetch_rooftop.py        # ROOFTOP_PV_ACTUAL MMSDM fetcher
 │   ├── load_rooftop.py         # Rooftop parquet → Postgres
 │   ├── fetch_open_meteo.py     # Open-Meteo Archive fetcher
 │   ├── load_weather.py         # Weather parquet → Postgres
-│   └── export_for_powerbi.py   # Precompute FWL residuals + Fisher OR for PB
+│   ├── export_for_powerbi.py   # Precompute FWL residuals + Fisher OR for PB
+│   ├── fetch_aemo_current.py   # Phase 2 — NEMWeb CURRENT 5-min dispatch scraper
+│   ├── fetch_rooftop_current.py# Phase 2 — NEMWeb CURRENT 30-min rooftop scraper
+│   ├── probe_nemweb_current.py # Phase 2 — read-only schema probe (dry-run)
+│   ├── predict.py              # Phase 2 — CLI inference (writes analytics.predictions)
+│   └── smoke_test_predict.py   # Phase 2 — regression test vs NB02 pickled test AUC
 ├── db/
 │   ├── 01_raw_schema.sql       # 3 raw tables (dispatch / rooftop / weather)
-│   └── 02_analytics_views.sql  # 8 analytics views
+│   ├── 02_analytics_views.sql  # 8 analytics views
+│   └── 03_predictions_schema.sql # Phase 2 — analytics.predictions + reconciliation view
 ├── notebooks/
 │   ├── 01_descriptive.ipynb    # Findings 1–3 + sub-findings
 │   └── 02_reversal_classifier.ipynb  # Findings 4–8
@@ -197,7 +223,10 @@ nem_negative_pricing/
 ├── figures/                    # 14 notebook-generated PNG outputs (10 embedded in this README)
 ├── docs/
 │   ├── METHODOLOGY.md          # Pre-registered hypotheses + verdicts
-│   └── DATA_SOURCES.md         # AEMO / Open-Meteo attribution
+│   ├── DATA_SOURCES.md         # AEMO / Open-Meteo attribution
+│   ├── PHASE2_STATUS.md        # Phase 2 — delivered / deferred / restart checklist
+│   └── NEMWEB_CURRENT_SCHEMA_DIFF.md # Phase 2 — schema diff CURRENT vs MMSDM
+├── models/                     # Phase 2 — joblib artefacts (gitignored; regenerable from NB02)
 ├── environment.yml             # conda env spec
 ├── .env.example                # Postgres connection template
 └── README.md
