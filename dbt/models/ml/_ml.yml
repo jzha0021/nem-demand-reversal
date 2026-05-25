@@ -1,0 +1,39 @@
+version: 2
+
+models:
+
+  - name: v_ml_features
+    description: >
+      Finding 8 feature warehouse, 1 row per (region, trading_day).
+      Target = is_reversal. prev_* columns are LAG-1 (D-1) — leak-free
+      for 24h-ahead forecast. Same-day weather/rooftop columns are
+      perfect-foresight; in production they would be NWP forecast +
+      AEMO rooftop forecast. Read by pipeline/predict.py via
+      explicit feature whitelist; NEVER `SELECT *`.
+    columns:
+      - name: regionid
+        tests:
+          - not_null
+      - name: trading_day
+        tests:
+          - not_null
+      - name: is_reversal
+        tests:
+          - not_null
+
+  - name: v_prediction_vs_actual
+    description: >
+      Reconciles pipeline/predict.py's logged probabilities with realised
+      is_reversal from v_ml_features. Use for AUC tracking as out-of-sample
+      rows accumulate. actual_is_reversal is NULL while predict_for_date
+      remains forward-looking (D+1 dispatch not yet ingested).
+    columns:
+      - name: predict_for_date
+        tests:
+          - not_null
+      - name: regionid
+        tests:
+          - not_null
+      - name: model_version
+        tests:
+          - not_null

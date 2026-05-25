@@ -32,7 +32,7 @@ Prerequisites
       - raw.region_5min     (dispatch)
       - raw.rooftop_pv_30min
       - analytics.v_h2_panel
-      - analytics.v_region_5min
+      - analytics.stg_region_5min
       - analytics.v_daily_demand_summary
 
 Usage
@@ -187,7 +187,7 @@ def export_h8_or(engine, out_path: Path) -> None:
             SELECT regionid,
                    trading_day,
                    BOOL_OR(is_negative_rrp) AS had_neg_rrp
-            FROM analytics.v_region_5min
+            FROM analytics.stg_region_5min
             GROUP BY 1, 2
         )
         SELECT s.regionid,

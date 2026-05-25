@@ -157,7 +157,7 @@ def build_feature_frame(
             SELECT trading_day,
                    AVG(semischedule_clearedmw) / NULLIF(AVG(totaldemand), 0)
                        AS share_today
-            FROM analytics.v_region_5min
+            FROM analytics.stg_region_5min
             WHERE regionid = :region
               AND trading_day BETWEEN :start AND :end
             GROUP BY 1

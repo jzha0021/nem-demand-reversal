@@ -1,14 +1,22 @@
 -- =====================================================================
--- 03_predictions_schema.sql — Phase 2 prediction log
+-- 03_predictions_schema.sql — Phase 2 prediction log (table only)
 -- =====================================================================
--- Run AFTER 02_analytics_views.sql:
+-- Run AFTER 01_raw_schema.sql + raw data ingest, BEFORE `dbt build`:
 --   psql -d nem -f db/03_predictions_schema.sql
 --
--- One row per (predict_for_date, regionid, model_version). Written by
--- pipeline/predict.py; read by monitoring queries + Power BI.
+-- Order matters: dbt's v_prediction_vs_actual model is
+--   CREATE VIEW ... FROM analytics.predictions JOIN analytics.v_ml_features
+-- which Postgres rejects unless analytics.predictions already exists.
 --
--- Multiple model_versions can coexist for the same (date, region) — this
--- enables A/B comparison and version rollback without losing history.
+-- Defines the analytics.predictions TABLE only. Reconciliation view
+-- analytics.v_prediction_vs_actual is managed by dbt
+-- (dbt/models/ml/v_prediction_vs_actual.sql) and reads this table
+-- via {{ source('analytics_ops', 'predictions') }}.
+--
+-- One row per (predict_for_date, regionid, model_version). Written by
+-- pipeline/predict.py. Multiple model_versions can coexist for the same
+-- (date, region) to enable A/B comparison and version rollback without
+-- losing history.
 -- =====================================================================
 
 CREATE SCHEMA IF NOT EXISTS analytics;
@@ -60,32 +68,6 @@ COMMENT ON COLUMN analytics.predictions.p_reversal IS
 COMMENT ON COLUMN analytics.predictions.model_version IS
     'String ID dumped with the joblib artefact, e.g. leak_free_lr_v1_YYYY-MM-DD. '
     'Pins the training end-date and feature list; bump on retrain.';
-
-
--- ---------------------------------------------------------------------
--- v_prediction_vs_actual — reconciliation view (read-only)
--- ---------------------------------------------------------------------
--- Joins predictions to the realised outcome from v_ml_features. Use for
--- daily/weekly AUC tracking once enough out-of-sample rows accumulate.
--- ---------------------------------------------------------------------
-CREATE OR REPLACE VIEW analytics.v_prediction_vs_actual AS
-SELECT
-    p.predict_for_date,
-    p.regionid,
-    p.model_version,
-    p.p_reversal,
-    p.predicted_label,
-    p.predicted_at,
-    f.is_reversal::int                                  AS actual_is_reversal,
-    (p.predicted_label = f.is_reversal::int)            AS hit
-FROM analytics.predictions p
-LEFT JOIN analytics.v_ml_features f
-    ON f.regionid = p.regionid AND f.trading_day = p.predict_for_date;
-
-COMMENT ON VIEW analytics.v_prediction_vs_actual IS
-    'Reconciles predictions with realised is_reversal from v_ml_features. '
-    'actual_is_reversal is NULL when the predict_for_date has not yet been '
-    'ingested (forward-looking predictions awaiting D+1 dispatch close).';
 
 
 -- =====================================================================

@@ -27,6 +27,7 @@ dependencies:
   - psycopg2-binary     # postgres driver (low-level, used for COPY FROM bulk load)
   - sqlalchemy>=2.0     # engine layer; required by pandas read_sql / to_sql
   - duckdb              # ad-hoc parquet query (lets us skip postgres during exploration)
+  - dbt-postgres        # SQL transformation layer; reads/writes analytics schema
 
   # utils
   - python-dotenv       # config / secrets

@@ -1,0 +1,72 @@
+version: 2
+
+sources:
+  - name: raw
+    description: "Raw AEMO + Open-Meteo tables, loaded by pipeline/*.py. Never edit by hand."
+    schema: raw
+    tables:
+
+      - name: region_5min
+        description: >
+          AEMO DISPATCHREGIONSUM. 5-min interval-ENDING (AEST, no DST).
+          ~1.93M rows: 5 regions × 385 632 intervals.
+        loaded_at_field: settlementdate
+        freshness:
+          warn_after: {count: 36, period: hour}
+          error_after: {count: 72, period: hour}
+        columns:
+          - name: settlementdate
+            description: "Interval-END timestamp (AEST naive). Shift -5min for trading_day."
+            tests:
+              - not_null
+          - name: regionid
+            description: "NEM region code."
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['NSW1', 'QLD1', 'SA1', 'TAS1', 'VIC1']
+          - name: totaldemand
+            description: "Operational demand in MW. Can go negative when BTM PV exceeds load."
+
+      - name: rooftop_pv_30min
+        description: >
+          AEMO ROOFTOP_PV_ACTUAL (MEASUREMENT). 30-min interval-ENDING (AEST).
+          Known gap: 2024-09-05 missing 2 intervals across all regions.
+        loaded_at_field: interval_datetime
+        freshness:
+          warn_after: {count: 36, period: hour}
+          error_after: {count: 72, period: hour}
+        columns:
+          - name: interval_datetime
+            description: "Interval-END timestamp (AEST naive). Shift -30min for trading_day."
+            tests:
+              - not_null
+          - name: regionid
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['NSW1', 'QLD1', 'SA1', 'TAS1', 'VIC1']
+          - name: power
+            description: "Behind-the-meter rooftop PV generation in MW."
+
+      - name: weather_daily
+        description: >
+          Open-Meteo ERA5 daily aggregates per region, in Australia/Brisbane tz
+          so `date` aligns with NEM trading_day. ~6.7K rows.
+        loaded_at_field: date
+        freshness:
+          warn_after: {count: 3, period: day}
+          error_after: {count: 10, period: day}
+        columns:
+          - name: date
+            description: "Trading day (Australia/Brisbane), already aligned to NEM trading_day."
+            tests:
+              - not_null
+          - name: regionid
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['NSW1', 'QLD1', 'SA1', 'TAS1', 'VIC1']

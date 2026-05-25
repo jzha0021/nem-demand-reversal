@@ -1,0 +1,63 @@
+version: 2
+
+models:
+
+  - name: stg_region_5min
+    description: >
+      Base 5-min dispatch view. Adds interval-START shift + trading_day + hour +
+      dow + reversal-interval / weekend / negative-demand / negative-rrp flags.
+      All downstream marts build on this — never on raw.region_5min.
+    columns:
+      - name: settlementdate
+        description: "Original interval-END timestamp from AEMO."
+        tests:
+          - not_null
+      - name: trading_day
+        description: "interval_start::date — the project's canonical day grain."
+        tests:
+          - not_null
+      - name: hour
+        description: "Hour of interval_start, 0..23."
+        tests:
+          - not_null
+      - name: regionid
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['NSW1', 'QLD1', 'SA1', 'TAS1', 'VIC1']
+      - name: is_reversal_interval
+        description: "Hour ∈ {10..15} (interval-START)."
+
+  - name: stg_rooftop_pv_30min
+    description: >
+      30-min rooftop PV with interval-START shift applied. Pure passthrough +
+      time shift; daily aggregation in marts/v_rooftop_daily.
+    columns:
+      - name: interval_datetime
+        tests:
+          - not_null
+      - name: trading_day
+        tests:
+          - not_null
+      - name: regionid
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['NSW1', 'QLD1', 'SA1', 'TAS1', 'VIC1']
+
+  - name: stg_weather_daily
+    description: >
+      Open-Meteo daily weather aggregated in Australia/Brisbane (no DST). `date`
+      already aligns with NEM trading_day; renamed to trading_day for join clarity.
+    columns:
+      - name: trading_day
+        tests:
+          - not_null
+      - name: regionid
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['NSW1', 'QLD1', 'SA1', 'TAS1', 'VIC1']

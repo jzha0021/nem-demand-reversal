@@ -1,0 +1,43 @@
+version: 2
+
+sources:
+  - name: analytics_ops
+    description: >
+      Operational tables in the analytics schema that are populated by
+      pipeline scripts (not by dbt). dbt reads them as sources but does
+      not manage their lifecycle — schema lives in db/03_predictions_schema.sql.
+    schema: analytics
+    tables:
+
+      - name: predictions
+        description: >
+          Phase 2 24h-ahead reversal forecast log. One row per
+          (predict_for_date, regionid, model_version). Written by
+          pipeline/predict.py; multiple model_versions can coexist for the
+          same (date, region) to enable A/B comparison.
+        columns:
+          - name: predict_for_date
+            description: "Target date D for which is_reversal was predicted."
+            tests:
+              - not_null
+          - name: regionid
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ['NSW1', 'QLD1', 'SA1', 'TAS1', 'VIC1']
+          - name: p_reversal
+            description: "predict_proba()[:, 1] for is_reversal=1. Range [0, 1]."
+            tests:
+              - not_null
+          - name: predicted_label
+            description: "(p_reversal >= 0.5) cast to smallint."
+            tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: [0, 1]
+          - name: model_version
+            description: "Joblib artefact ID, e.g. leak_free_lr_v1_YYYY-MM-DD."
+            tests:
+              - not_null

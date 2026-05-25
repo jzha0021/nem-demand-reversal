@@ -1,0 +1,90 @@
+version: 2
+
+models:
+
+  - name: v_daily_demand_summary
+    description: >
+      One row per (regionid, trading_day). Max/min/mean/std demand,
+      argmin/argmax hour-of-day, neg-demand interval count, dow flag.
+    columns:
+      - name: regionid
+        tests:
+          - not_null
+      - name: trading_day
+        tests:
+          - not_null
+      - name: n_intervals
+        tests:
+          - not_null
+
+  - name: v_reversal_events
+    description: >
+      Trading days satisfying the reversal definition (daily-min hour ∈ {10..15}).
+      Subset of v_daily_demand_summary.
+    columns:
+      - name: regionid
+        tests:
+          - not_null
+      - name: trading_day
+        tests:
+          - not_null
+      - name: min_demand_hour
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [10, 11, 12, 13, 14, 15]
+
+  - name: v_monthly_reversal_rate
+    description: >
+      Monthly reversal panel per (region, month). Headline metric reversal_pct.
+      Inputs for Findings 1 (frequency saturation) and 3 (cross-region trajectory).
+    columns:
+      - name: regionid
+        tests:
+          - not_null
+      - name: month
+        tests:
+          - not_null
+      - name: reversal_pct
+        description: "0..100. n_reversal_days / n_trading_days × 100."
+
+  - name: v_demand_h03_h13_panel
+    description: >
+      Finding 2 monthly panel: hour-03 vs hour-13 mean TOTALDEMAND per region.
+      Run OLS on gap_h03_minus_h13 ~ time + C(month).
+    columns:
+      - name: regionid
+        tests:
+          - not_null
+      - name: month
+        tests:
+          - not_null
+
+  - name: v_rooftop_daily
+    description: >
+      Daily rooftop PV summary per (region, trading_day). All metrics gated on
+      n_intervals = 48 → NULL on partial-interval days (e.g. 2024-09-05).
+    columns:
+      - name: regionid
+        tests:
+          - not_null
+      - name: trading_day
+        tests:
+          - not_null
+      - name: n_intervals
+        tests:
+          - not_null
+
+  - name: v_h2_panel
+    description: >
+      Finding 4 monthly panel per (region, month). Per-region OLS:
+      target ~ p95_rooftop_mw + time_idx + C(calendar_month), with
+      Newey-West HAC standard errors (maxlags = 6).
+    columns:
+      - name: regionid
+        tests:
+          - not_null
+      - name: month
+        tests:
+          - not_null

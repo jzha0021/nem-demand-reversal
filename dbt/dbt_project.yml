@@ -1,0 +1,27 @@
+name: 'nem_demand'
+version: '0.1.0'
+config-version: 2
+
+profile: 'nem_demand'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  nem_demand:
+    +materialized: view
+    staging:
+      +tags: ["staging"]
+    marts:
+      +tags: ["marts"]
+    ml:
+      +tags: ["ml"]
