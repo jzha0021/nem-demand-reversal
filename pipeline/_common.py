@@ -17,7 +17,12 @@ Convention reminder:
 
 from __future__ import annotations
 
+import csv
+import io
+import zipfile
+
 import pandas as pd
+import requests
 
 # ---------------------------------------------------------------------------
 # Column narrowing — DISPATCHREGIONSUM ⨝ DISPATCHPRICE merged frame
@@ -119,3 +124,90 @@ def add_trading_period(
     out["trading_day"] = interval_start.dt.date
     out["hour"] = interval_start.dt.hour
     return out
+
+
+# ---------------------------------------------------------------------------
+# NEMWeb CURRENT MMS-format CSV parser (used by fetch_*_current.py)
+# ---------------------------------------------------------------------------
+# AEMO publishes CURRENT zips containing a single CSV in the multi-table MMS
+# format:
+#     C, <comment row>
+#     I, <PACKAGE>, <TABLE>, <VERSION>, <col1>, <col2>, ...
+#     D, <PACKAGE>, <TABLE>, <VERSION>, <val1>, <val2>, ...
+#     I, <PACKAGE>, <ANOTHER_TABLE>, ...
+#     C, "END OF REPORT", <row count>
+#
+# `I` rows are headers (their column list applies to subsequent `D` rows for
+# the same table). Multiple tables can appear in one CSV (DispatchIS bundles
+# 7 tables; rooftop has just 1).
+#
+# Time semantics + table naming differences vs MMSDM are documented in
+# docs/NEMWEB_CURRENT_SCHEMA_DIFF.md — both end up as interval-END timestamps.
+
+NEMWEB_USR_AGENT = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) nem_demand_reversal/phase2"
+    )
+}
+
+
+def download_nemweb_zip(url: str, timeout: int = 90) -> bytes:
+    """Fetch a single NEMWeb zip, raise for HTTP errors. Returns raw bytes."""
+    r = requests.get(url, headers=NEMWEB_USR_AGENT, timeout=timeout)
+    r.raise_for_status()
+    return r.content
+
+
+def parse_mms_zip(blob: bytes) -> dict[str, pd.DataFrame]:
+    """Parse an MMS-format zip blob into {<PACKAGE>_<TABLE>: DataFrame}.
+
+    All cells are returned as strings — callers cast to the dtypes they need
+    (matches the existing pipeline: COPY FROM CSV does the final coercion at
+    the Postgres boundary).
+
+    Empty / unknown table names produce a key like '_<row index>'; callers
+    should filter on the expected table key explicitly.
+    """
+    z = zipfile.ZipFile(io.BytesIO(blob))
+    csvs = [n for n in z.namelist() if n.lower().endswith(".csv")]
+    if not csvs:
+        raise RuntimeError(f"no .csv in zip; namelist={z.namelist()}")
+    text = z.read(csvs[0]).decode("utf-8", errors="replace")
+
+    tables: dict[str, list[list[str]]] = {}
+    headers: dict[str, list[str]] = {}
+    current_key: str | None = None
+
+    for line in text.splitlines():
+        if not line or line[0] == "C":
+            continue
+        parts = next(csv.reader([line]))
+        rtype = parts[0]
+        if rtype == "I" and len(parts) >= 5:
+            current_key = f"{parts[1]}_{parts[2]}"
+            headers[current_key] = parts[4:]
+            tables.setdefault(current_key, [])
+        elif rtype == "D" and current_key is not None and len(parts) >= 5:
+            tables[current_key].append(parts[4:])
+
+    out: dict[str, pd.DataFrame] = {}
+    for key, rows in tables.items():
+        cols = headers[key]
+        # Pad / truncate any oddly-shaped rows so DataFrame ctor doesn't choke
+        normalised = [r[: len(cols)] + [None] * (len(cols) - len(r)) for r in rows]
+        out[key] = pd.DataFrame(normalised, columns=cols)
+    return out
+
+
+def df_to_insert_rows(df: pd.DataFrame) -> list[tuple]:
+    """DataFrame → list of tuples ready for psycopg2 execute_values.
+
+    Replaces every NaN / NaT / pd.NA with Python None so psycopg2 emits SQL
+    NULL instead of the float literal 'NaN' (which Postgres would happily
+    accept into a numeric column, producing a NaN value rather than NULL —
+    a semantic split from the MMSDM path that uses COPY ... NULL '').
+    """
+    arr = df.to_numpy(dtype=object)
+    arr[pd.isna(arr)] = None
+    return list(map(tuple, arr))
