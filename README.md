@@ -333,7 +333,7 @@ nem_demand_reversal/
 │   ├── OPS_RUNBOOK.md              # Object inventory + restart checklist + cost + known issues
 │   └── NEMWEB_CURRENT_SCHEMA_DIFF.md  # NEMWeb CURRENT vs MMSDM schema gotchas
 ├── models/                         # leak_free_lr.joblib committed; other dumps gitignored
-├── environment.yml                 # conda env spec
+├── environment.conda.yml           # conda env spec (renamed so Streamlit Cloud doesn't auto-pick conda over pip)
 ├── requirements.txt                # slim deps for Streamlit Cloud deploy
 ├── .env.example                    # Postgres + S3 + Snowflake env template
 └── README.md
@@ -349,7 +349,7 @@ For local replay of the findings without touching cloud infra:
 
 ```bash
 # 1. Environment
-conda env create -f environment.yml
+conda env create -f environment.conda.yml
 conda activate nem_demand
 cp .env.example .env                                # then fill DB_PWD
 

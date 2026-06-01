@@ -1,6 +1,6 @@
 # Streamlit Community Cloud installs from this file when the repo is
 # deployed at https://share.streamlit.io. It is a slim subset of
-# environment.yml — only what streamlit_app.py actually imports at run
+# environment.conda.yml — only what streamlit_app.py actually imports at run
 # time, so the deployment image stays small.
 
 streamlit>=1.40
