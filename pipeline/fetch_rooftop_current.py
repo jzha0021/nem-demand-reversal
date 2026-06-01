@@ -31,12 +31,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import psycopg2
-import psycopg2.extras
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from tqdm import tqdm
+
+# psycopg2 imported lazily inside get_conn() / insert_rows() so a CI
+# run with --no-db doesn't need the Postgres driver installed.
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "pipeline"))
@@ -80,6 +81,7 @@ ROOFTOP_COLS_LOWER = [c.lower() for c in ROOFTOP_COLS]
 # DB helpers
 # ---------------------------------------------------------------------------
 def get_conn():
+    import psycopg2  # lazy: CI with --no-db doesn't need Postgres driver
     missing = [v for v in ("DB_NAME", "DB_USER", "DB_PWD") if os.getenv(v) is None]
     if missing:
         sys.exit(f"Missing env vars in .env: {missing}")
@@ -160,6 +162,7 @@ def insert_rows(conn, schema: str, df: pd.DataFrame) -> tuple[int, int]:
         f"VALUES %s "
         f"ON CONFLICT (interval_datetime, regionid) DO NOTHING"
     )
+    import psycopg2.extras
     rows = df_to_insert_rows(df)
     with conn:
         with conn.cursor() as cur:
