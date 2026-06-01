@@ -11,6 +11,8 @@ Quantifying how rooftop solar has flipped the NEM from max-demand-constrained to
 
 Pipeline: AEMO NEMWeb CURRENT + Open-Meteo Archive → AWS S3 (raw zip + parsed parquet) → Snowpipe → Snowflake → dbt → predict.py inference → Streamlit Community Cloud public dashboard. Postgres + Power BI are retained for the original retrospective analysis layer.
 
+**Live dashboard:** [https://nem-demand-reversal.streamlit.app](https://nem-demand-reversal.streamlit.app) — reads Snowflake `NEM.ANALYTICS` continuously; daily cron refreshes underlying data every morning at AEST 01:00.
+
 ---
 
 ## Why this matters

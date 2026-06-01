@@ -148,7 +148,7 @@ else:
         .properties(height=380)
         .interactive()
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +224,7 @@ else:
         )
         .properties(height=320)
     )
-    st.altair_chart(pred_chart, use_container_width=True)
+    st.altair_chart(pred_chart, width="stretch")
 
 
 # ---------------------------------------------------------------------------
