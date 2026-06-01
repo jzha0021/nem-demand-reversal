@@ -1,0 +1,150 @@
+name: daily-incremental
+
+# Fires at 15:00 UTC daily = 01:00 AEST next day.
+# Slot chosen so the full D-1 trading day has finished publishing on NEMWeb
+# CURRENT before we pull. workflow_dispatch lets us trigger manually for
+# smoke testing.
+on:
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Override --since for NEMWeb fetch (YYYY-MM-DD AEST)."
+        required: false
+        default: ""
+      predict_date:
+        description: "Override predict.py --date (YYYY-MM-DD). Default: today AEST."
+        required: false
+        default: ""
+
+# OIDC requires id-token: write. contents: read is sufficient for checkout.
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: daily-incremental
+  cancel-in-progress: false
+
+jobs:
+  ingest-build-predict:
+    name: NEMWeb → S3 → Snowpipe → dbt → predict
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      AWS_REGION: ap-southeast-2
+      S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_ROLE: R_NEM_RW
+      SNOWFLAKE_WAREHOUSE: WH_NEM
+      SNOWFLAKE_DATABASE: NEM
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install runtime deps
+        # scikit-learn is pinned to the version the joblib artefact in
+        # models/leak_free_lr.joblib was fit on; predict.py's
+        # load_artefact() asserts an exact match and exits non-zero on
+        # drift, so a silent upgrade would fail loud.
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            boto3 requests beautifulsoup4 'pandas<3' tqdm python-dotenv \
+            pyarrow holidays joblib 'scikit-learn==1.8.0' sqlalchemy \
+            snowflake-connector-python snowflake-sqlalchemy \
+            dbt-snowflake
+
+      # ----------------------------------------------------------------
+      # Step 1: NEMWeb CURRENT → S3 (raw zip + parsed parquet)
+      # CI has no Postgres, so --no-db; the parquet upload still fires
+      # because S3_BUCKET is set.
+      # ----------------------------------------------------------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-southeast-2
+          role-session-name: gh-actions-nem-demand-${{ github.run_id }}
+
+      - name: fetch_aemo_current.py → S3
+        env:
+          SINCE: ${{ inputs.since }}
+        run: |
+          ARGS="--no-db"
+          if [ -n "$SINCE" ]; then ARGS="$ARGS --since $SINCE"; fi
+          python pipeline/fetch_aemo_current.py $ARGS
+
+      - name: fetch_rooftop_current.py → S3
+        env:
+          SINCE: ${{ inputs.since }}
+        run: |
+          ARGS="--no-db"
+          if [ -n "$SINCE" ]; then ARGS="$ARGS --since $SINCE"; fi
+          python pipeline/fetch_rooftop_current.py $ARGS
+
+      - name: fetch_open_meteo.py → S3 (last 14 days, D-1 mandatory)
+        # Fresh CI runners have no local parquet state, so we pin --start
+        # to today-14d — uploads ~70 rows (14 days × 5 regions) per run
+        # instead of 6700. Historical weather is already in Snowflake
+        # from the one-shot backfill, and staging dedupes on
+        # (date, regionid) so overlapping windows don't leak duplicates.
+        #
+        # --max-walkback is intentionally NOT passed: predict.py needs
+        # D-1 weather, so we want this step to fail red on ERA5 lag
+        # rather than walk back to D-2 and then silently drop today's
+        # prediction inside predict.py's dropna().
+        run: |
+          START="$(TZ='Australia/Brisbane' date -d 'today - 14 days' +'%Y-%m-%d')"
+          python pipeline/fetch_open_meteo.py --start "$START"
+
+      # ----------------------------------------------------------------
+      # Step 2: wait for Snowpipe to drain the parquet we just uploaded
+      # ----------------------------------------------------------------
+      - name: Wait 60s for Snowpipe to ingest fresh parquet
+        run: sleep 60
+
+      # ----------------------------------------------------------------
+      # Step 3: rebuild analytics layer on Snowflake. dbt picks up the
+      # new raw rows automatically (views).
+      # ----------------------------------------------------------------
+      - name: dbt build (Snowflake)
+        run: |
+          dbt build --project-dir dbt --target snowflake \
+            --profiles-dir .github/dbt-ci
+
+      # ----------------------------------------------------------------
+      # Step 4: today's reversal probability prediction.
+      # Target date D = today in AEST (predict for the trading day that
+      # just started, conditioned on D-1's now-ingested data).
+      # ----------------------------------------------------------------
+      - name: predict.py --target snowflake
+        env:
+          PREDICT_DATE: ${{ inputs.predict_date }}
+        run: |
+          if [ -n "$PREDICT_DATE" ]; then
+            D="$PREDICT_DATE"
+          else
+            D="$(TZ='Australia/Brisbane' date +'%Y-%m-%d')"
+          fi
+          python pipeline/predict.py --target snowflake --date "$D"
+
+      # ----------------------------------------------------------------
+      # Step 5: Snowpipe health check. Fails the workflow if any of the
+      # 3 pipes is stale > 26h, surfacing missed ingests via GitHub's
+      # email-on-failure default.
+      # ----------------------------------------------------------------
+      - name: Snowpipe health check
+        run: |
+          python pipeline/check_pipe_status.py --max-stale-hours 26

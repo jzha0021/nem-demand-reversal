@@ -1,0 +1,22 @@
+# CI-only dbt profile — read by the daily-incremental workflow via
+# `dbt build --profiles-dir .github/dbt-ci`. All connection details come
+# from GitHub Actions env vars / secrets; no plaintext credentials live
+# in this file.
+#
+# The local-dev profile in `~/.dbt/profiles.yml` is independent and
+# preserved (it has both `dev` Postgres and `snowflake` outputs).
+
+nem_demand:
+  target: snowflake
+  outputs:
+    snowflake:
+      type: snowflake
+      account:   "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user:      "{{ env_var('SNOWFLAKE_USER') }}"
+      password:  "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role:      "{{ env_var('SNOWFLAKE_ROLE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database:  "{{ env_var('SNOWFLAKE_DATABASE') }}"
+      schema:    ANALYTICS
+      threads: 4
+      client_session_keep_alive: false
