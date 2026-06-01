@@ -12,7 +12,7 @@ SELECT
     CASE WHEN COUNT(*) = 48 THEN MAX(power)         END                 AS peak_mw,
     CASE WHEN COUNT(*) = 48 THEN SUM(power) * 0.5   END                 AS total_mwh,
     CASE WHEN COUNT(*) = 48 THEN
-        AVG(power) FILTER (WHERE hour BETWEEN 10 AND 15)
+        {{ avg_if('power', 'hour BETWEEN 10 AND 15') }}
     END                                                                 AS midday_mean_mw,
     CASE WHEN COUNT(*) = 48 THEN
         PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY power)

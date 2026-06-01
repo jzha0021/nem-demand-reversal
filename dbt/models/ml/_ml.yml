@@ -6,7 +6,7 @@ models:
     description: >
       Finding 8 feature warehouse, 1 row per (region, trading_day).
       Target = is_reversal. prev_* columns are LAG-1 (D-1) — leak-free
-      for 24h-ahead forecast. Same-day weather/rooftop columns are
+      for next-day forecast. Same-day weather/rooftop columns are
       perfect-foresight; in production they would be NWP forecast +
       AEMO rooftop forecast. Read by pipeline/predict.py via
       explicit feature whitelist; NEVER `SELECT *`.

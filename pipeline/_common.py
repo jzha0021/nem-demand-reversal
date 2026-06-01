@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import zipfile
+from functools import lru_cache
 
 import pandas as pd
 import requests
@@ -147,14 +149,51 @@ def add_trading_period(
 NEMWEB_USR_AGENT = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) nem_demand_reversal/phase2"
+        "(KHTML, like Gecko) nem_demand_reversal/1.0"
     )
 }
 
 
-def download_nemweb_zip(url: str, timeout: int = 90) -> bytes:
-    """Fetch a single NEMWeb zip, raise for HTTP errors. Returns raw bytes."""
-    r = requests.get(url, headers=NEMWEB_USR_AGENT, timeout=timeout)
+def make_nemweb_session() -> requests.Session:
+    """A requests Session with retry+backoff suitable for NEMWeb scraping.
+
+    NEMWeb occasionally 403s mid-sequence under sustained polling (WAF /
+    rate-limit signals fire when a single IP downloads hundreds of zips
+    back-to-back). Exponential backoff on 403/429/5xx clears nearly all
+    transient blocks; the few permanently-missing files surface after the
+    retry budget is exhausted.
+    """
+    from urllib3.util.retry import Retry
+    from requests.adapters import HTTPAdapter
+
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=1.0,                           # 0s, 2s, 4s, 8s, 16s
+        status_forcelist=[403, 429, 500, 502, 503, 504],
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def download_nemweb_zip(
+    url: str,
+    session: requests.Session | None = None,
+    timeout: int = 90,
+) -> bytes:
+    """Fetch a single NEMWeb zip, raise for HTTP errors. Returns raw bytes.
+
+    Caller may pass a shared :func:`make_nemweb_session` to amortise the
+    retry adapter + TCP pool across many downloads. When ``session`` is
+    ``None`` a fresh retry-enabled session is built per call (slower but
+    fine for ad-hoc use).
+    """
+    sess = session if session is not None else make_nemweb_session()
+    r = sess.get(url, headers=NEMWEB_USR_AGENT, timeout=timeout)
     r.raise_for_status()
     return r.content
 
@@ -211,3 +250,125 @@ def df_to_insert_rows(df: pd.DataFrame) -> list[tuple]:
     arr = df.to_numpy(dtype=object)
     arr[pd.isna(arr)] = None
     return list(map(tuple, arr))
+
+
+# ---------------------------------------------------------------------------
+# S3 raw-zip mirror (used by fetch_*_current.py when S3_BUCKET is set)
+# ---------------------------------------------------------------------------
+# boto3 is imported lazily so notebooks that only use add_trading_period etc.
+# don't need it on the path. Local: AWS_PROFILE=nem in .env picks up
+# ~/.aws/credentials. CI: OIDC exports AWS_* env vars so default credential
+# chain works without a profile.
+
+@lru_cache(maxsize=1)
+def _get_s3_client():
+    import boto3
+    return boto3.client("s3", region_name=os.getenv("AWS_REGION", "ap-southeast-2"))
+
+
+def s3_enabled() -> bool:
+    """S3 mirror is opt-in via S3_BUCKET env var. Returns False when unset."""
+    return bool(os.getenv("S3_BUCKET"))
+
+
+def upload_blob_to_s3(
+    blob: bytes,
+    key: str,
+    *,
+    bucket: str | None = None,
+    skip_if_exists: bool = True,
+) -> tuple[bool, str]:
+    """Upload `blob` to `s3://<bucket>/<key>`. Idempotent via HEAD-then-PUT.
+
+    Returns ``(uploaded, reason)``. ``uploaded=False`` means the key already
+    existed and was skipped — same idea as ``ON CONFLICT DO NOTHING`` at
+    the DB layer, applied to the object store.
+    """
+    from botocore.exceptions import ClientError
+    bucket = bucket or os.getenv("S3_BUCKET")
+    if not bucket:
+        raise RuntimeError("S3_BUCKET env var not set (and no `bucket=` override)")
+    client = _get_s3_client()
+    if skip_if_exists:
+        try:
+            client.head_object(Bucket=bucket, Key=key)
+            return False, "exists"
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") not in ("404", "NoSuchKey", "NotFound"):
+                raise
+    client.put_object(Bucket=bucket, Key=key, Body=blob)
+    return True, "uploaded"
+
+
+# ---------------------------------------------------------------------------
+# Parsed parquet → S3 (Snowpipe ingestion source)
+# ---------------------------------------------------------------------------
+# Fetchers accumulate the parsed DataFrame across their per-zip loop and
+# call upload_parquet_to_s3() once after the loop. One parquet per run
+# keeps Snowpipe per-file billing trivial and avoids Snowflake's
+# small-file inefficiency. Filename is UTC-timestamped + UUID-suffixed so
+# concurrent runs don't collide. Duplicate rows across runs are expected
+# and deduped downstream by the dbt staging models.
+
+def upload_parquet_to_s3(
+    df: "pd.DataFrame",
+    source: str,
+    *,
+    bucket: str | None = None,
+    timestamp_utc: "pd.Timestamp | None" = None,
+    key: str | None = None,
+) -> tuple[str, int]:
+    """Write `df` as snappy parquet, upload to `s3://<bucket>/parsed/<source>/...`.
+
+    The default key embeds a UTC ISO timestamp + short UUID so a daily
+    cron writes a unique file per run. Pass an explicit ``key=`` (full
+    path under the bucket root) for deterministic uploads — backfill
+    uses ``parsed/<source>/backfill_<YYYY-MM>.parquet`` so re-runs hit
+    Snowpipe's load-history dedupe instead of writing fresh duplicates.
+
+    Empty df is a no-op — callers don't need to guard. Returns ``('', 0)``
+    in that case.
+    """
+    import io
+    import uuid
+
+    if df.empty:
+        return "", 0
+
+    bucket = bucket or os.getenv("S3_BUCKET")
+    if not bucket:
+        raise RuntimeError("S3_BUCKET env var not set (and no `bucket=` override)")
+
+    if key is None:
+        ts = (timestamp_utc if timestamp_utc is not None
+              else pd.Timestamp.now("UTC")).strftime("%Y-%m-%dT%H-%M-%SZ")
+        suffix = uuid.uuid4().hex[:8]
+        key = f"parsed/{source}/{ts}_{suffix}.parquet"
+
+    # Snowflake's parquet reader silently mangles native parquet
+    # TIMESTAMP[us]/[ns] columns when ingested through a
+    # MATCH_BY_COLUMN_NAME pipe — the row lands but downstream
+    # queries render the column as "Invalid date". Writing every
+    # date-like column as an ISO-8601 string sidesteps the whole codec:
+    # Snowflake implicitly casts VARCHAR → TIMESTAMP_NTZ / DATE on COPY,
+    # which is rock-solid. Cost: parquet stores them as strings rather
+    # than native parquet TIMESTAMP, invisible to the rest of the
+    # pipeline.
+    import datetime as _dt
+
+    df = df.copy()
+    for col in df.columns:
+        s = df[col]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            df[col] = s.dt.strftime("%Y-%m-%d %H:%M:%S")
+        elif s.dtype == object:
+            first_nn = s.dropna()
+            if not first_nn.empty and isinstance(first_nn.iloc[0], _dt.date):
+                df[col] = s.astype("string")
+
+    buf = io.BytesIO()
+    df.to_parquet(buf, engine="pyarrow", compression="snappy", index=False)
+    body = buf.getvalue()
+
+    _get_s3_client().put_object(Bucket=bucket, Key=key, Body=body)
+    return key, len(body)

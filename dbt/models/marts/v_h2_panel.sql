@@ -7,7 +7,7 @@
 WITH rooftop_monthly AS (
     SELECT
         regionid,
-        date_trunc('month', trading_day)::date                          AS month,
+        {{ to_date(dbt.date_trunc('month', 'trading_day')) }}           AS month,
         AVG(peak_mw)                                                    AS mean_daily_peak_mw,
         PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY peak_mw)           AS p95_rooftop_mw,
         AVG(midday_mean_mw)                                             AS mean_midday_mw,

@@ -1,8 +1,8 @@
 -- =====================================================================
--- 03_predictions_schema.sql — Phase 2 prediction log (table only)
+-- 02_predictions_schema.sql — Prediction log (table only)
 -- =====================================================================
 -- Run AFTER 01_raw_schema.sql + raw data ingest, BEFORE `dbt build`:
---   psql -d nem -f db/03_predictions_schema.sql
+--   psql -d nem -f db/02_predictions_schema.sql
 --
 -- Order matters: dbt's v_prediction_vs_actual model is
 --   CREATE VIEW ... FROM analytics.predictions JOIN analytics.v_ml_features
@@ -23,7 +23,7 @@ CREATE SCHEMA IF NOT EXISTS analytics;
 
 
 -- ---------------------------------------------------------------------
--- analytics.predictions — 24h-ahead reversal probability log
+-- analytics.predictions — next-day reversal probability log (D from D-1 features)
 -- ---------------------------------------------------------------------
 -- predict_for_date  = the D for which we predicted is_reversal (= 1 if D's
 --                     min-demand hour ∈ {10..15}).
@@ -55,7 +55,7 @@ CREATE INDEX IF NOT EXISTS idx_predictions_region_date
     ON analytics.predictions (regionid, predict_for_date);
 
 COMMENT ON TABLE analytics.predictions IS
-    'Phase 2 24h-ahead reversal forecast log. Written by pipeline/predict.py. '
+    'Next-day reversal forecast log (D from D-1 features). Written by pipeline/predict.py. '
     'PK allows multiple model_versions per (date, region) for A/B comparison.';
 
 COMMENT ON COLUMN analytics.predictions.predict_for_date IS

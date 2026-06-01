@@ -1,0 +1,18 @@
+{
+  "_comment": "Template — fill the two placeholder values from your own Snowflake DESC STORAGE INTEGRATION S3_NEM output before applying. The principal ARN identifies Snowflake's per-account IAM user; the external ID is the per-integration trust token. Real values are deployment-specific and should not be committed.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "<STORAGE_AWS_IAM_USER_ARN from DESC STORAGE INTEGRATION>"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "<STORAGE_AWS_EXTERNAL_ID from DESC STORAGE INTEGRATION>"
+        }
+      }
+    }
+  ]
+}

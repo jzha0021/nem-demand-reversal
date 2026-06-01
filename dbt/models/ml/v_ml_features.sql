@@ -4,6 +4,10 @@
 -- Exposes both leak-free (prev_*) and perfect-foresight (same-day) columns;
 -- notebook + predict.py select features by explicit whitelist, NEVER `SELECT *`.
 
+{# Snowflake doesn't support the `WINDOW name AS (...)` clause, so the
+   window spec is inlined on every LAG via Jinja substitution. #}
+{% set w = '(PARTITION BY regionid ORDER BY trading_day)' %}
+
 WITH daily_join AS (
     SELECT
         s.regionid,
@@ -11,6 +15,7 @@ WITH daily_join AS (
         s.dow,
         s.is_weekend,
         EXTRACT(MONTH FROM s.trading_day)::smallint                     AS month,
+        s.n_intervals,
         s.max_demand,
         s.min_demand,
         s.min_demand_hour,
@@ -33,6 +38,7 @@ WITH daily_join AS (
 SELECT
     regionid,
     trading_day,
+    n_intervals,
     is_reversal,
     min_demand,
     max_demand,
@@ -40,16 +46,16 @@ SELECT
     month,
     dow,
     is_weekend,
-    LAG(max_demand)             OVER w  AS prev_max_demand,
-    LAG(min_demand)             OVER w  AS prev_min_demand,
-    LAG(is_reversal::int)       OVER w  AS prev_is_reversal,
-    LAG(t_max_c)                OVER w  AS prev_t_max_c,
-    LAG(solar_mj_m2)            OVER w  AS prev_solar_mj_m2,
-    LAG(sunshine_seconds)       OVER w  AS prev_sunshine_seconds,
-    LAG(precip_mm)              OVER w  AS prev_precip_mm,
-    LAG(rooftop_peak_mw)        OVER w  AS prev_rooftop_peak_mw,
-    LAG(rooftop_midday_mean_mw) OVER w  AS prev_rooftop_midday_mean_mw,
-    LAG(rooftop_total_mwh)      OVER w  AS prev_rooftop_total_mwh,
+    LAG(max_demand)                       OVER {{ w }}  AS prev_max_demand,
+    LAG(min_demand)                       OVER {{ w }}  AS prev_min_demand,
+    LAG({{ bool_to_int('is_reversal') }}) OVER {{ w }}  AS prev_is_reversal,
+    LAG(t_max_c)                          OVER {{ w }}  AS prev_t_max_c,
+    LAG(solar_mj_m2)                      OVER {{ w }}  AS prev_solar_mj_m2,
+    LAG(sunshine_seconds)                 OVER {{ w }}  AS prev_sunshine_seconds,
+    LAG(precip_mm)                        OVER {{ w }}  AS prev_precip_mm,
+    LAG(rooftop_peak_mw)                  OVER {{ w }}  AS prev_rooftop_peak_mw,
+    LAG(rooftop_midday_mean_mw)           OVER {{ w }}  AS prev_rooftop_midday_mean_mw,
+    LAG(rooftop_total_mwh)                OVER {{ w }}  AS prev_rooftop_total_mwh,
     t_max_c,
     t_min_c,
     solar_mj_m2,
@@ -60,4 +66,3 @@ SELECT
     rooftop_total_mwh,
     rooftop_p95_mw
 FROM daily_join
-WINDOW w AS (PARTITION BY regionid ORDER BY trading_day)

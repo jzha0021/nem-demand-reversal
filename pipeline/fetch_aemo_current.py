@@ -57,7 +57,11 @@ from _common import (
     NEMWEB_USR_AGENT,
     df_to_insert_rows,
     download_nemweb_zip,
+    make_nemweb_session,
     parse_mms_zip,
+    s3_enabled,
+    upload_blob_to_s3,
+    upload_parquet_to_s3,
 )
 
 load_dotenv(PROJECT_ROOT / ".env")
@@ -204,7 +208,19 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--dry-run", action="store_true",
-        help="Skip DB INSERT; print row counts only.",
+        help="Skip DB INSERT + S3 upload; print row counts only.",
+    )
+    ap.add_argument(
+        "--no-s3", action="store_true",
+        help="Skip S3 raw-zip mirror even if S3_BUCKET is set.",
+    )
+    ap.add_argument(
+        "--no-parquet", action="store_true",
+        help="Skip parsed parquet upload to s3://.../parsed/dispatch/.",
+    )
+    ap.add_argument(
+        "--no-db", action="store_true",
+        help="Skip Postgres INSERT (useful for CI runs that only mirror to S3).",
     )
     return ap.parse_args()
 
@@ -222,7 +238,7 @@ def main() -> int:
     print(f"[fetch] window AEST: {args.since}  →  {until}")
     print(f"[fetch] DB schema:   {schema}  dry_run={args.dry_run}")
 
-    session = requests.Session()
+    session = make_nemweb_session()
     try:
         zips = list_zips_in_window(args.since, until, session)
     except Exception as e:
@@ -236,9 +252,17 @@ def main() -> int:
         print("[fetch] nothing to do — exiting")
         return 0
 
-    conn = None if args.dry_run else get_conn()
+    use_db = not (args.dry_run or args.no_db)
+    use_s3 = not args.dry_run and not args.no_s3 and s3_enabled()
+    use_parquet = not args.dry_run and not args.no_parquet and s3_enabled()
+    conn = get_conn() if use_db else None
+    print(f"[fetch] db={'on' if use_db else 'off'}  "
+          f"s3_zip={'on' if use_s3 else 'off'}  "
+          f"s3_parquet={'on' if use_parquet else 'off'}")
 
     total_attempted = total_inserted = total_skipped_existing = 0
+    s3_uploaded = s3_already = 0
+    parsed_dfs: list[pd.DataFrame] = []
     failed: list[tuple[str, str]] = []
 
     pbar = tqdm(zips, unit="zip")
@@ -246,12 +270,29 @@ def main() -> int:
         pbar.set_description(ts.strftime("%m-%d %H:%M"))
         try:
             t0 = time.time()
-            blob = download_nemweb_zip(url, timeout=30)
+            blob = download_nemweb_zip(url, session=session, timeout=60)
+
+            if use_s3:
+                fname = url.rsplit("/", 1)[-1]
+                s3_key = f"raw/dispatch/{ts:%Y-%m-%d}/{fname}"
+                uploaded, _ = upload_blob_to_s3(blob, s3_key)
+                if uploaded:
+                    s3_uploaded += 1
+                else:
+                    s3_already += 1
+
             df = extract_merged_rows(blob)
+            if use_parquet:
+                parsed_dfs.append(df)
             if args.dry_run:
                 total_attempted += len(df)
                 pbar.write(f"[{ts:%Y-%m-%d %H:%M}] {len(df):3d} rows  "
                            f"{time.time() - t0:4.1f}s  (dry-run)")
+                continue
+            if not use_db:
+                total_attempted += len(df)
+                pbar.write(f"[{ts:%Y-%m-%d %H:%M}] {len(df):3d} rows  "
+                           f"{time.time() - t0:4.1f}s  (s3-only)")
                 continue
             attempted, inserted = insert_rows(conn, schema, df)
             total_attempted += attempted
@@ -268,9 +309,19 @@ def main() -> int:
     if conn is not None:
         conn.close()
 
+    parquet_key, parquet_bytes = "", 0
+    if use_parquet and parsed_dfs:
+        batched = pd.concat(parsed_dfs, ignore_index=True)
+        parquet_key, parquet_bytes = upload_parquet_to_s3(batched, source="dispatch")
+
     print("\n" + "=" * 72)
     print(f"Complete. attempted={total_attempted}  inserted={total_inserted}  "
           f"dup-skipped={total_skipped_existing}  failed_zips={len(failed)}")
+    if use_s3:
+        print(f"S3 raw zip: uploaded={s3_uploaded}  already_present={s3_already}")
+    if use_parquet and parquet_key:
+        print(f"S3 parquet: s3://{os.getenv('S3_BUCKET')}/{parquet_key}  "
+              f"({parquet_bytes:,} bytes)")
     if failed:
         print("\nFailed zips (first 5):")
         for u, e in failed[:5]:

@@ -4,11 +4,18 @@
 -- model touches `settlementdate` directly; everything uses `trading_day`
 -- / `hour` derived here. Mirrors the contract in pipeline/_common.py
 -- (add_trading_period) and docs/METHODOLOGY.md.
+--
+-- Snowflake-side dedup: see the `dedupe_latest` macro. On Postgres
+-- the macro renders as a plain passthrough since the raw layer
+-- already enforces PK via ON CONFLICT DO NOTHING.
 
-WITH shifted AS (
+WITH deduped AS (
+    {{ dedupe_latest(source('raw', 'region_5min'),
+                     ['settlementdate', 'regionid']) }}
+), shifted AS (
     SELECT
         settlementdate,
-        settlementdate - interval '5 minutes'                            AS interval_start,
+        {{ dbt.dateadd('minute', -5, 'settlementdate') }}                AS interval_start,
         regionid,
         intervention,
         totaldemand,
@@ -19,16 +26,16 @@ WITH shifted AS (
         demand_and_nonschedgen,
         netinterchange,
         rrp
-    FROM {{ source('raw', 'region_5min') }}
+    FROM deduped
 )
 SELECT
     settlementdate,
     interval_start,
-    interval_start::date                                            AS trading_day,
+    CAST(interval_start AS DATE)                                    AS trading_day,
     EXTRACT(HOUR FROM interval_start)::smallint                     AS hour,
     EXTRACT(DOW  FROM interval_start)::smallint                     AS dow,
-    (EXTRACT(HOUR FROM interval_start)::int BETWEEN 10 AND 15)      AS is_reversal_interval,
-    (EXTRACT(DOW  FROM interval_start)::int IN (0, 6))              AS is_weekend,
+    (EXTRACT(HOUR FROM interval_start) BETWEEN 10 AND 15)           AS is_reversal_interval,
+    (EXTRACT(DOW  FROM interval_start) IN (0, 6))                   AS is_weekend,
     regionid,
     intervention,
     totaldemand,

@@ -29,9 +29,19 @@ Strategy
 
 ERA5 publication latency
 ------------------------
-Open-Meteo Archive's ERA5 backend has ~5-day publication latency.
-A daily cron asking for "today" or "yesterday" will hit the 99 %
-coverage gate. For incremental pulls, request end_date ≤ today − 7 days.
+Open-Meteo Archive's ERA5 backend has ~5-day nominal latency but in
+practice publishes within ~1 day of the trading day closing. The
+default --end is today − 1 to reflect that empirical lag, which is
+the freshness predict.py needs (model features include D-1 weather).
+If ERA5 lags further on a given day the 99 % coverage gate trips,
+the fetcher exits non-zero, and the daily cron fails red so the
+operator notices — silent regression past D-1 weather would let
+predict.py drop today's row.
+
+For catch-up runs where the operator is willing to accept staler
+weather (historical backfill, model retrain experiments), pass
+--max-walkback N to retry with progressively older --end values up
+to N days back. The daily production cron does NOT pass this flag.
 
 Output
 ------
@@ -39,9 +49,10 @@ data/parquet/weather_daily/weather_daily_<REGIONID>.parquet  (one per region)
 
 Usage
 -----
-    python pipeline/fetch_open_meteo.py                     # full window, all 5 regions
+    python pipeline/fetch_open_meteo.py                     # default end = today − 1d
     python pipeline/fetch_open_meteo.py --region SA1
-    python pipeline/fetch_open_meteo.py --start 2022-08-01 --end 2026-03-31
+    python pipeline/fetch_open_meteo.py --end 2026-05-27    # explicit catch-up tail
+    python pipeline/fetch_open_meteo.py --max-walkback 7    # accept up to today − 8d on coverage miss
     python pipeline/fetch_open_meteo.py --force             # re-download all
 
 """
@@ -51,13 +62,14 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
 import requests
 from tqdm import tqdm
 
-from _common import WEATHER_COLS
+from _common import WEATHER_COLS, s3_enabled, upload_parquet_to_s3
 
 # -----------------------------------------------------------------------------
 # Config
@@ -67,9 +79,21 @@ PARQUET_OUT = PROJECT_ROOT / "data" / "parquet" / "weather_daily"
 
 ENDPOINT = "https://archive-api.open-meteo.com/v1/archive"
 
-# Project window — must match fetch_aemo.py / fetch_rooftop.py.
+# Project window start — must match fetch_aemo.py / fetch_rooftop.py.
 DEFAULT_START = "2022-08-01"
-DEFAULT_END = "2026-03-31"
+
+
+def _default_end() -> str:
+    """Dynamic default for --end: today minus 1 day.
+
+    Live inference needs D-1 weather features (model has prev_t_max_c
+    etc.), so the default targets the freshest end-date typically
+    available. ERA5's empirical lag is ~1 day; on rare days when it
+    lags further the 99 % coverage gate trips and the fetcher exits
+    non-zero unless the caller explicitly opts in to walkback via
+    --max-walkback N.
+    """
+    return (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
 
 # Unified tz for all 5 regions so daily aggregation windows align with
 # NEM trading_day. See module docstring for rationale.
@@ -167,7 +191,9 @@ def _api_fetch(regionid: str, start: str, end: str) -> tuple[pd.DataFrame, float
         raise RuntimeError(
             f"{regionid}: coverage below {COVERAGE_MIN_PCT}% threshold for "
             f"range {start}→{end} on {details}. ERA5 publication latency "
-            f"may be the cause — for cron, use end_date ≤ today−7d."
+            f"may be the cause. The daily cron's contract is today−1; "
+            f"for catch-up runs pass --max-walkback N to retry with "
+            f"progressively older end-dates."
         )
 
     df = df.rename(columns={"time": "date", **API_TO_COL})
@@ -181,10 +207,12 @@ def _api_fetch(regionid: str, start: str, end: str) -> tuple[pd.DataFrame, float
 
 
 def fetch_one_region(regionid: str, start: str, end: str,
-                     force: bool) -> dict:
+                     force: bool, use_parquet_s3: bool = False) -> dict:
     """Date-range-aware fetch for one region. See module docstring for strategy.
 
     Returns dict with status='full'|'append'|'skip' and per-status stats.
+    When ``use_parquet_s3`` is True, the newly-fetched rows are also
+    uploaded to s3://.../parsed/weather/ for Snowpipe to ingest.
     """
     out = parquet_path(regionid)
     req_start_d = pd.to_datetime(start).date()
@@ -225,6 +253,9 @@ def fetch_one_region(regionid: str, start: str, end: str,
                 subset=["date", "regionid"], keep="last"
             ).sort_values("date").reset_index(drop=True)
             combined.to_parquet(out, compression="snappy", index=False)
+            s3_key = ""
+            if use_parquet_s3:
+                s3_key, _ = upload_parquet_to_s3(new_df, source="weather")
             return {
                 "status":           "append",
                 "download_s":       download_s,
@@ -233,6 +264,7 @@ def fetch_one_region(regionid: str, start: str, end: str,
                 "appended_range":   (gap_start, end),
                 "coverage_min_pct": min(coverage.values()),
                 "size_kb":          out.stat().st_size / 1024,
+                "s3_parquet_key":   s3_key,
             }
 
         # Start moved (or stored data is wider than requested): refetch full.
@@ -243,12 +275,16 @@ def fetch_one_region(regionid: str, start: str, end: str,
     # ------------------------------------------------------------------
     df, download_s, coverage = _api_fetch(regionid, start, end)
     df.to_parquet(out, compression="snappy", index=False)
+    s3_key = ""
+    if use_parquet_s3:
+        s3_key, _ = upload_parquet_to_s3(df, source="weather")
     return {
         "status":           "full",
         "download_s":       download_s,
         "rows_total":       len(df),
         "coverage_min_pct": min(coverage.values()),
         "size_kb":          out.stat().st_size / 1024,
+        "s3_parquet_key":   s3_key,
     }
 
 
@@ -262,8 +298,16 @@ def parse_args() -> argparse.Namespace:
         help=f"YYYY-MM-DD (default: {DEFAULT_START})",
     )
     ap.add_argument(
-        "--end", default=DEFAULT_END,
-        help=f"YYYY-MM-DD inclusive (default: {DEFAULT_END})",
+        "--end", default=None,
+        help="YYYY-MM-DD inclusive (default: today minus 1 day; the "
+             "freshness predict.py's D-1 weather features require)",
+    )
+    ap.add_argument(
+        "--max-walkback", type=int, default=0,
+        help="On coverage-gate failure, retry with progressively older "
+             "--end values up to N days back. Default 0 — daily cron "
+             "wants live freshness or to fail red. Set 7+ for "
+             "operator-driven catch-up runs.",
     )
     ap.add_argument(
         "--region",
@@ -274,11 +318,17 @@ def parse_args() -> argparse.Namespace:
         "--force", action="store_true",
         help="Re-download and overwrite existing parquet files",
     )
+    ap.add_argument(
+        "--no-parquet", action="store_true",
+        help="Skip uploading the per-region delta parquet to "
+             "s3://.../parsed/weather/ (default: upload if S3_BUCKET is set).",
+    )
     return ap.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    end = args.end or _default_end()
 
     PARQUET_OUT.mkdir(parents=True, exist_ok=True)
 
@@ -287,10 +337,13 @@ def main() -> int:
     else:
         regions = sorted(REGIONS.keys())
 
-    print(f"Target window: {args.start} → {args.end}")
+    use_parquet_s3 = (not args.no_parquet) and s3_enabled()
+
+    print(f"Target window: {args.start} → {end}")
     print(f"Regions:       {regions}")
     print(f"Output dir:    {PARQUET_OUT}")
-    print(f"Force:         {args.force}\n")
+    print(f"Force:         {args.force}")
+    print(f"S3 parquet:    {'on' if use_parquet_s3 else 'off'}\n")
 
     skipped = appended = full = 0
     failed: list[tuple[str, str]] = []
@@ -298,11 +351,35 @@ def main() -> int:
     pbar = tqdm(regions, unit="reg")
     for regionid in pbar:
         pbar.set_description(regionid)
-        try:
-            stats = fetch_one_region(regionid, args.start, args.end, args.force)
-        except Exception as e:
-            failed.append((regionid, f"{type(e).__name__}: {e}"))
-            pbar.write(f"[{regionid}] FAIL — {type(e).__name__}: {e}")
+        # Walk-back loop: --max-walkback controls how far back to retry on
+        # an ERA5 coverage-gate trip. Default 0 means daily cron either
+        # gets today-1 weather or fails red so predict.py for today
+        # doesn't silently drop the row (D-1 weather features required).
+        # Operators running a manual catch-up can pass --max-walkback 7+.
+        try_end = end
+        stats: dict | None = None
+        last_err: Exception | None = None
+        for attempt in range(args.max_walkback + 1):
+            try:
+                stats = fetch_one_region(regionid, args.start, try_end, args.force,
+                                         use_parquet_s3=use_parquet_s3)
+                if attempt > 0:
+                    pbar.write(f"[{regionid}] WARN walked back {attempt} day(s) "
+                               f"to end={try_end}; live inference for the "
+                               f"untouched tail will lack D-1 weather")
+                break
+            except RuntimeError as e:
+                # Only walk back on the ERA5 coverage-gate failure;
+                # any other RuntimeError (schema, network) propagates.
+                if "coverage below" not in str(e):
+                    raise
+                last_err = e
+                try_end = (pd.Timestamp(try_end) - pd.Timedelta(days=1)
+                           ).strftime("%Y-%m-%d")
+        if stats is None:
+            failed.append((regionid, f"COVERAGE_GATE: {last_err}"))
+            pbar.write(f"[{regionid}] FAIL — coverage gate (max-walkback "
+                       f"{args.max_walkback}): {last_err}")
             continue
 
         if stats["status"] == "skip":

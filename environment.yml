@@ -12,11 +12,12 @@ dependencies:
 
   # stats / ML
   - statsmodels         # OLS in 01_descriptive (H6 panel slope test)
-  - scikit-learn        # LR + RF for 02_reversal_classifier (Sub-Q3)
+  - scikit-learn=1.8    # pinned: pickled artefact in models/leak_free_lr.joblib was fit on 1.8
 
   # plotting
   - matplotlib
   - seaborn
+  - altair              # declarative charts used by streamlit_app.py
 
   # notebook
   - jupyterlab
@@ -24,10 +25,13 @@ dependencies:
   - ipywidgets          # jupysql autocomplete / table preview dependency
 
   # db
-  - psycopg2-binary     # postgres driver (low-level, used for COPY FROM bulk load)
-  - sqlalchemy>=2.0     # engine layer; required by pandas read_sql / to_sql
-  - duckdb              # ad-hoc parquet query (lets us skip postgres during exploration)
-  - dbt-postgres        # SQL transformation layer; reads/writes analytics schema
+  - psycopg2-binary             # postgres driver (low-level, used for COPY FROM bulk load)
+  - sqlalchemy>=2.0             # engine layer; required by pandas read_sql / to_sql
+  - duckdb                      # ad-hoc parquet query (lets us skip postgres during exploration)
+  - dbt-postgres                # dbt adapter — local Postgres dev target
+  - dbt-snowflake               # dbt adapter — cloud Snowflake target
+  - snowflake-connector-python  # predict.py + backfill direct Snowflake writes
+  - snowflake-sqlalchemy        # SQLAlchemy dialect for snowflake:// URLs — unifies paramstyle with Postgres
 
   # utils
   - python-dotenv       # config / secrets
@@ -37,7 +41,8 @@ dependencies:
   - pip
   - pip:
     - nemosis>=3.8      # AEMO MMSDM downloader (PyPI only, no conda channel)
-    - boto3             # S3 raw backup (incidental in Phase 1, primary in Phase 2)
+    - boto3             # S3 raw + parquet uploads
     - jupysql           # %%sql cell magic in notebooks
     - sqlalchemy-utils  # jupysql dependency for connection health checks
     - holidays>=0.50    # AU public-holiday flags for ML feature engineering
+    - streamlit>=1.40   # public dashboard host (conda-forge pin is too old → use pip)

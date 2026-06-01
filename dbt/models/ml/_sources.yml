@@ -5,13 +5,13 @@ sources:
     description: >
       Operational tables in the analytics schema that are populated by
       pipeline scripts (not by dbt). dbt reads them as sources but does
-      not manage their lifecycle — schema lives in db/03_predictions_schema.sql.
+      not manage their lifecycle — schema lives in db/02_predictions_schema.sql.
     schema: analytics
     tables:
 
       - name: predictions
         description: >
-          Phase 2 24h-ahead reversal forecast log. One row per
+          Next-day reversal forecast log (D from D-1 features). One row per
           (predict_for_date, regionid, model_version). Written by
           pipeline/predict.py; multiple model_versions can coexist for the
           same (date, region) to enable A/B comparison.
