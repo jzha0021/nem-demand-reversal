@@ -355,6 +355,14 @@ def upload_parquet_to_s3(
     # than native parquet TIMESTAMP, invisible to the rest of the
     # pipeline.
     import datetime as _dt
+    import re as _re
+
+    # AEMO MMS timestamps land as raw strings "YYYY/MM/DD HH:MM:SS"
+    # (slashes, not dashes). Snowflake's auto-cast VARCHAR→TIMESTAMP_NTZ
+    # doesn't recognise the slash format and the COPY fails with
+    # "Failed to cast variant value ... to TIMESTAMP_NTZ". Parse those
+    # strings to datetime first, then the next branch re-emits ISO.
+    _mms_ts_re = _re.compile(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$")
 
     df = df.copy()
     for col in df.columns:
@@ -363,8 +371,14 @@ def upload_parquet_to_s3(
             df[col] = s.dt.strftime("%Y-%m-%d %H:%M:%S")
         elif s.dtype == object:
             first_nn = s.dropna()
-            if not first_nn.empty and isinstance(first_nn.iloc[0], _dt.date):
+            if first_nn.empty:
+                continue
+            sample = first_nn.iloc[0]
+            if isinstance(sample, _dt.date):
                 df[col] = s.astype("string")
+            elif isinstance(sample, str) and _mms_ts_re.match(sample):
+                df[col] = (pd.to_datetime(s, format="%Y/%m/%d %H:%M:%S")
+                           .dt.strftime("%Y-%m-%d %H:%M:%S"))
 
     buf = io.BytesIO()
     df.to_parquet(buf, engine="pyarrow", compression="snappy", index=False)
