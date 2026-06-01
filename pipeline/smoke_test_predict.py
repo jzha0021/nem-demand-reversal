@@ -24,8 +24,8 @@ What it does
 
 Run
 ---
-    python pipeline/smoke_test_predict.py
-    python pipeline/smoke_test_predict.py --artefact models/leak_free_lr.joblib
+    python pipeline/smoke_test_predict.py                       # default Postgres
+    python pipeline/smoke_test_predict.py --target snowflake    # cloud DW
 """
 
 from __future__ import annotations
@@ -47,9 +47,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Smoke-test predict.py vs NB02 AUC.")
     ap.add_argument("--artefact", type=Path,
                     default=predict_mod.DEFAULT_ARTEFACT)
+    ap.add_argument("--target", choices=["postgres", "snowflake"], default="postgres",
+                    help="DB target (must have the analytics layer built).")
     ap.add_argument("--tol", type=float, default=1e-6,
                     help="Max |AUC_replay − AUC_artefact| (default 1e-6).")
     args = ap.parse_args()
+    target = predict_mod.POSTGRES if args.target == "postgres" else predict_mod.SNOWFLAKE
 
     artefact = predict_mod.load_artefact(args.artefact)
     region   = artefact["target_region"]
@@ -61,54 +64,61 @@ def main() -> int:
     auc_expected = float(artefact["test_auc"])
 
     test_dates = pd.date_range(split_date, test_end, freq="D").date.tolist()
-    print(f"[smoke] artefact={args.artefact.name}")
+    print(f"[smoke] artefact={args.artefact.name}  target={target.name}")
     print(f"[smoke] region={region}  n_test_dates={len(test_dates)}  "
           f"[{split_date} .. {test_end}]")
     print(f"[smoke] artefact test_auc={auc_expected:.6f}")
 
-    engine = predict_mod.get_engine()
-    feats = predict_mod.build_feature_frame(engine, test_dates, region, first_day)
-    X_df  = predict_mod.filter_to_targets(feats, feature_cols, test_dates)
+    engine = predict_mod.get_engine(target)
+    try:
+        feats = predict_mod.build_feature_frame(
+            engine, target, test_dates, region, first_day,
+        )
+        X_df = predict_mod.filter_to_targets(feats, feature_cols, test_dates)
 
-    if X_df.empty:
-        sys.exit("ERROR: no feature rows after filtering — DB ingested up to "
-                 f"{test_end}?")
+        if X_df.empty:
+            sys.exit("ERROR: no feature rows after filtering — DB ingested up to "
+                     f"{test_end}?")
 
-    p = pipeline.predict_proba(X_df[feature_cols])[:, 1]
+        p = pipeline.predict_proba(X_df[feature_cols])[:, 1]
 
-    actual = pd.read_sql(
-        text(
-            """
+        # is_reversal::INT cast works on both Postgres and Snowflake (Snowflake
+        # treats BOOLEAN→INT via NUMBER alias). MATCH_BY_COLUMN_NAME is N/A here
+        # so the result column case is target-dependent — lowercase it after.
+        actual_sql = text(f"""
             SELECT trading_day, is_reversal::int AS is_reversal
-            FROM analytics.v_ml_features
+            FROM {target.tbl_features}
             WHERE regionid = :region
               AND trading_day BETWEEN :a AND :b
-            """
-        ),
-        engine,
-        params={"region": region, "a": split_date, "b": test_end},
-        parse_dates=["trading_day"],
-    )
+        """)
+        actual = pd.read_sql(
+            actual_sql, engine,
+            params={"region": region, "a": split_date, "b": test_end},
+            parse_dates=["trading_day"],
+        )
+        actual.columns = [c.lower() for c in actual.columns]
 
-    merged = X_df[["trading_day"]].assign(p=p).merge(
-        actual, on="trading_day", how="inner",
-    )
-    if len(merged) != len(X_df):
-        sys.exit(f"ERROR: {len(X_df) - len(merged)} predicted rows had no "
-                 "actual is_reversal — check v_ml_features coverage.")
+        merged = X_df[["trading_day"]].assign(p=p).merge(
+            actual, on="trading_day", how="inner",
+        )
+        if len(merged) != len(X_df):
+            sys.exit(f"ERROR: {len(X_df) - len(merged)} predicted rows had no "
+                     "actual is_reversal — check v_ml_features coverage.")
 
-    auc_replay = roc_auc_score(merged["is_reversal"], merged["p"])
-    gap = abs(auc_replay - auc_expected)
+        auc_replay = roc_auc_score(merged["is_reversal"], merged["p"])
+        gap = abs(auc_replay - auc_expected)
 
-    print(f"[smoke] AUC replay     = {auc_replay:.6f}")
-    print(f"[smoke] AUC artefact   = {auc_expected:.6f}")
-    print(f"[smoke] |gap|          = {gap:.2e}   tol={args.tol:.0e}")
+        print(f"[smoke] AUC replay     = {auc_replay:.6f}")
+        print(f"[smoke] AUC artefact   = {auc_expected:.6f}")
+        print(f"[smoke] |gap|          = {gap:.2e}   tol={args.tol:.0e}")
 
-    if gap > args.tol:
-        print("[smoke] FAIL — predict.py and NB02 feature builders have drifted.")
-        return 1
-    print("[smoke] PASS")
-    return 0
+        if gap > args.tol:
+            print("[smoke] FAIL — predict.py and NB02 feature builders have drifted.")
+            return 1
+        print("[smoke] PASS")
+        return 0
+    finally:
+        engine.dispose()
 
 
 if __name__ == "__main__":

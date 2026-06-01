@@ -1,5 +1,5 @@
 """
-24h-ahead reversal probability — daily inference CLI.
+Next-day reversal probability — daily inference CLI (predicts trading day D from D-1 features).
 
 Loads the leak-free Logistic Regression pipeline dumped at the end of
 notebooks/02_reversal_classifier.ipynb and writes P(is_reversal) for one or
@@ -9,7 +9,7 @@ The feature contract is the artefact's single source of truth:
     artefact['features_leakfree']  — column order
     artefact['first_trading_day']  — anchors time_idx (row position relative
                                      to NB02 training-time row 0)
-    artefact['target_region']      — VIC1 in Phase 1; reusable in Phase 3
+    artefact['target_region']      — VIC1 today; other regions reusable on retrain
     artefact['model_version']      — pinned to (training-end-date + feature set)
 
 Notebook-derived features replicated here verbatim:
@@ -20,7 +20,8 @@ Notebook-derived features replicated here verbatim:
 
 Usage
 -----
-    python pipeline/predict.py --date 2026-03-15
+    python pipeline/predict.py --date 2026-03-15                       # default Postgres (local)
+    python pipeline/predict.py --date 2026-03-15 --target snowflake    # cloud DW
     python pipeline/predict.py --backfill 2025-01-01 2025-01-07
     python pipeline/predict.py --date 2026-03-15 --dry-run
 
@@ -39,35 +40,97 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 
 import holidays
 import joblib
-import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ARTEFACT = PROJECT_ROOT / "models" / "leak_free_lr.joblib"
 
 
 # ---------------------------------------------------------------------------
-# DB connection (mirrors pipeline/export_for_powerbi.py)
+# DB target dispatch — Postgres (local dev SOT) vs Snowflake (cloud DW)
 # ---------------------------------------------------------------------------
-def get_engine() -> Engine:
+# Same analytics-layer SQL works on both targets (dbt models mirror each
+# other under analytics on Postgres / NEM.ANALYTICS on Snowflake). The
+# only divergences are the connection factory and the prediction UPSERT
+# syntax (Postgres ON CONFLICT vs Snowflake MERGE).
+
+@dataclass(frozen=True)
+class DBTarget:
+    """Per-target metadata: connection factory + schema-qualified table names."""
+    name: str
+    tbl_features: str       # qualified analytics.v_ml_features
+    tbl_stg_region: str     # qualified analytics.stg_region_5min
+    tbl_predictions: str    # qualified analytics.predictions
+
+
+POSTGRES = DBTarget(
+    name="postgres",
+    tbl_features="analytics.v_ml_features",
+    tbl_stg_region="analytics.stg_region_5min",
+    tbl_predictions="analytics.predictions",
+)
+
+SNOWFLAKE = DBTarget(
+    name="snowflake",
+    tbl_features="NEM.ANALYTICS.V_ML_FEATURES",
+    tbl_stg_region="NEM.ANALYTICS.STG_REGION_5MIN",
+    tbl_predictions="NEM.ANALYTICS.PREDICTIONS",
+)
+
+
+def get_engine(target: DBTarget):
+    """Return a SQLAlchemy engine. Both Postgres and Snowflake go through
+    SQLAlchemy so callers can use a single ``:name`` paramstyle (and the
+    same ``pd.read_sql(text(sql), engine, params=...)`` invocation) across
+    targets. Snowflake uses snowflake-sqlalchemy.
+    """
+    from sqlalchemy import create_engine
     load_dotenv(PROJECT_ROOT / ".env")
-    user = os.getenv("DB_USER", "postgres")
-    pwd  = os.getenv("DB_PWD")
-    host = os.getenv("DB_HOST", "localhost")
-    port = os.getenv("DB_PORT", "5432")
-    name = os.getenv("DB_NAME", "nem")
-    if not pwd:
-        sys.exit("ERROR: DB_PWD not set in .env")
-    return create_engine(f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{name}")
+
+    if target.name == "postgres":
+        pwd = os.getenv("DB_PWD")
+        if not pwd:
+            sys.exit("ERROR: DB_PWD not set in .env")
+        user = os.getenv("DB_USER", "postgres")
+        host = os.getenv("DB_HOST", "localhost")
+        port = os.getenv("DB_PORT", "5432")
+        name = os.getenv("DB_NAME", "nem")
+        return create_engine(f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{name}")
+
+    if target.name == "snowflake":
+        from snowflake.sqlalchemy import URL
+        # All Snowflake connection details come from env vars (loaded
+        # from .env locally; from GitHub Actions secrets in CI). No
+        # deployment-specific defaults baked into the code, so this
+        # repo is portable across operators.
+        required = {
+            "account":  os.getenv("SNOWFLAKE_ACCOUNT"),
+            "user":     os.getenv("SNOWFLAKE_USER"),
+            "password": os.getenv("SNOWFLAKE_PASSWORD"),
+        }
+        missing = [k for k, v in required.items() if not v]
+        if missing:
+            sys.exit(f"ERROR: missing SNOWFLAKE_{'/'.join(m.upper() for m in missing)} "
+                     f"in env (.env or shell) — see .env.example for the contract")
+        return create_engine(URL(
+            account=required["account"],
+            user=required["user"],
+            password=required["password"],
+            role=os.getenv("SNOWFLAKE_ROLE", "R_NEM_RW"),
+            warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", "WH_NEM"),
+            database=os.getenv("SNOWFLAKE_DATABASE", "NEM"),
+            schema=os.getenv("SNOWFLAKE_SCHEMA", "ANALYTICS"),
+        ))
+
+    sys.exit(f"ERROR: unknown DB target {target.name!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -88,52 +151,68 @@ def load_artefact(path: Path) -> dict:
     missing = required - set(art)
     if missing:
         sys.exit(f"ERROR: artefact missing keys: {sorted(missing)}")
+
+    # sklearn version drift check — joblib pickles are tightly coupled to
+    # the sklearn version they were fit on (internal class layouts and
+    # private attrs change between versions). Refuse to run if the
+    # current sklearn doesn't match the one stored in the artefact;
+    # silent incompatibility risks degraded probabilities without any
+    # exception being raised.
+    pinned = art.get("sklearn_lib_version")
+    if pinned:
+        import sklearn
+        if sklearn.__version__ != pinned:
+            sys.exit(
+                f"ERROR: sklearn version drift — artefact fit on "
+                f"{pinned}, current is {sklearn.__version__}. Either "
+                f"reinstall scikit-learn=={pinned} or retrain the "
+                f"artefact via notebooks/02_reversal_classifier.ipynb."
+            )
+
     return art
 
 
 # ---------------------------------------------------------------------------
-# Feature builder
-# ---------------------------------------------------------------------------
-# Notebook-derived features that don't come straight from v_ml_features.
-# Keep this in sync with notebooks/02_reversal_classifier.ipynb cell 24.
+# Feature builder — same SQL on both targets, only table qualifiers differ
 # ---------------------------------------------------------------------------
 def build_feature_frame(
-    engine: Engine,
+    engine,
+    target: DBTarget,
     target_dates: list[date],
     region: str,
     first_trading_day: date,
 ) -> pd.DataFrame:
-    """Return one row per target date with all FEATURES_LEAKFREE columns.
+    """Return one row per trading_day with all FEATURES_LEAKFREE columns.
 
     Rows with NULL on any feature are dropped (matching NB02 cell 25
     `vic_clean = vic.dropna(subset=needed_cols)`).
     """
-    # Pull a window that covers every target plus the 7-day lookback needed
-    # by lag7_rooftop_p95_mw. Pulling everything from first_trading_day is
-    # cheap (~1300 rows) and keeps the lag-7 / D-1 logic identical to NB02.
+    from sqlalchemy import text
+
     target_min = min(target_dates)
     target_max = max(target_dates)
     window_start = min(first_trading_day, target_min - timedelta(days=8))
 
+    feats_sql = text(f"""
+        SELECT *
+        FROM {target.tbl_features}
+        WHERE regionid = :region
+          AND trading_day BETWEEN :start AND :end
+        ORDER BY trading_day
+    """)
     feats = pd.read_sql(
-        text(
-            """
-            SELECT *
-            FROM analytics.v_ml_features
-            WHERE regionid = :region
-              AND trading_day BETWEEN :start AND :end
-            ORDER BY trading_day
-            """
-        ),
-        engine,
+        feats_sql, engine,
         params={"region": region, "start": window_start, "end": target_max},
         parse_dates=["trading_day"],
     )
+    # Snowflake's SQLAlchemy dialect returns column names uppercased by default —
+    # normalise to lowercase so downstream feature builder is target-agnostic.
+    feats.columns = [c.lower() for c in feats.columns]
     if feats.empty:
         sys.exit(
-            f"ERROR: no rows in analytics.v_ml_features for region={region} "
-            f"between {window_start} and {target_max}. Did you run pipeline/"
-            "fetch_*.py + load_*.py for this date range?"
+            f"ERROR: no rows in {target.tbl_features} for region={region} "
+            f"between {window_start} and {target_max}. Did the dbt build / "
+            "Snowpipe ingest cover this range?"
         )
 
     # --- Notebook-derived features (mirror NB02 cell 24 exactly) ---
@@ -151,23 +230,22 @@ def build_feature_frame(
 
     feats["lag7_rooftop_p95_mw"] = feats["rooftop_p95_mw"].shift(7)
 
+    util_sql = text(f"""
+        SELECT trading_day,
+               AVG(semischedule_clearedmw) / NULLIF(AVG(totaldemand), 0)
+                   AS share_today
+        FROM {target.tbl_stg_region}
+        WHERE regionid = :region
+          AND trading_day BETWEEN :start AND :end
+        GROUP BY 1
+        ORDER BY 1
+    """)
     util = pd.read_sql(
-        text(
-            """
-            SELECT trading_day,
-                   AVG(semischedule_clearedmw) / NULLIF(AVG(totaldemand), 0)
-                       AS share_today
-            FROM analytics.stg_region_5min
-            WHERE regionid = :region
-              AND trading_day BETWEEN :start AND :end
-            GROUP BY 1
-            ORDER BY 1
-            """
-        ),
-        engine,
+        util_sql, engine,
         params={"region": region, "start": window_start, "end": target_max},
         parse_dates=["trading_day"],
     )
+    util.columns = [c.lower() for c in util.columns]
     util["semisched_share_yesterday"] = util["share_today"].shift(1)
     feats = feats.merge(
         util[["trading_day", "semisched_share_yesterday"]],
@@ -200,29 +278,68 @@ def filter_to_targets(
 
 
 # ---------------------------------------------------------------------------
-# DB write
+# UPSERT — different syntax per target
 # ---------------------------------------------------------------------------
-UPSERT_SQL = text("""
-    INSERT INTO analytics.predictions
-        (predict_for_date, regionid, p_reversal, predicted_label,
-         model_version, predicted_at)
-    VALUES (:d, :r, :p, :lab, :ver, :ts)
-    ON CONFLICT (predict_for_date, regionid, model_version)
-    DO UPDATE SET
-        p_reversal      = EXCLUDED.p_reversal,
-        predicted_label = EXCLUDED.predicted_label,
-        predicted_at    = EXCLUDED.predicted_at
-""")
+def write_predictions(engine, target: DBTarget, rows: list[dict[str, Any]]) -> None:
+    """Idempotent upsert. Same row repeatedly = same final state.
 
-
-def write_predictions(
-    engine: Engine,
-    rows: list[dict],
-) -> None:
+    Both targets go through SQLAlchemy with ``:name`` paramstyle; only the
+    upsert syntax diverges (Postgres ON CONFLICT vs Snowflake MERGE).
+    """
     if not rows:
         return
+    from sqlalchemy import text
+
+    if target.name == "postgres":
+        upsert = text(f"""
+            INSERT INTO {target.tbl_predictions}
+                (predict_for_date, regionid, p_reversal, predicted_label,
+                 model_version, predicted_at)
+            VALUES (:d, :r, :p, :lab, :ver, :ts)
+            ON CONFLICT (predict_for_date, regionid, model_version)
+            DO UPDATE SET
+                p_reversal      = EXCLUDED.p_reversal,
+                predicted_label = EXCLUDED.predicted_label,
+                predicted_at    = EXCLUDED.predicted_at
+        """)
+    elif target.name == "snowflake":
+        upsert = text(f"""
+            MERGE INTO {target.tbl_predictions} AS t
+            USING (
+                SELECT
+                    CAST(:d   AS DATE)          AS predict_for_date,
+                    CAST(:r   AS VARCHAR)       AS regionid,
+                    CAST(:p   AS FLOAT)         AS p_reversal,
+                    CAST(:lab AS INTEGER)       AS predicted_label,
+                    CAST(:ver AS VARCHAR)       AS model_version,
+                    CAST(:ts  AS TIMESTAMP_LTZ) AS predicted_at
+            ) AS s
+            ON  t.PREDICT_FOR_DATE = s.predict_for_date
+            AND t.REGIONID         = s.regionid
+            AND t.MODEL_VERSION    = s.model_version
+            WHEN MATCHED THEN UPDATE SET
+                P_REVERSAL      = s.p_reversal,
+                PREDICTED_LABEL = s.predicted_label,
+                PREDICTED_AT    = s.predicted_at
+            WHEN NOT MATCHED THEN INSERT (
+                PREDICT_FOR_DATE, REGIONID, P_REVERSAL, PREDICTED_LABEL,
+                MODEL_VERSION, PREDICTED_AT
+            ) VALUES (
+                s.predict_for_date, s.regionid, s.p_reversal,
+                s.predicted_label, s.model_version, s.predicted_at
+            )
+        """)
+    else:
+        sys.exit(f"ERROR: write_predictions: unknown DB target {target.name!r}")
+
     with engine.begin() as conn:
-        conn.execute(UPSERT_SQL, rows)
+        # Snowflake MERGE doesn't support executemany of multi-row params via
+        # SQLAlchemy — execute row-by-row. Postgres handles the list directly.
+        if target.name == "snowflake":
+            for row in rows:
+                conn.execute(upsert, row)
+        else:
+            conn.execute(upsert, rows)
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +347,7 @@ def write_predictions(
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="24h-ahead reversal probability inference.",
+        description="Next-day reversal probability inference (D from D-1 features).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     grp = ap.add_mutually_exclusive_group(required=True)
@@ -244,6 +361,10 @@ def parse_args() -> argparse.Namespace:
         nargs=2, metavar=("START", "END"),
         type=lambda s: datetime.strptime(s, "%Y-%m-%d").date(),
         help="Replay an inclusive date range (smoke test / backfill).",
+    )
+    ap.add_argument(
+        "--target", choices=["postgres", "snowflake"], default="postgres",
+        help="DB target (default: postgres for the local dev loop).",
     )
     ap.add_argument(
         "--region", default=None,
@@ -262,6 +383,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    target = POSTGRES if args.target == "postgres" else SNOWFLAKE
     artefact = load_artefact(args.artefact)
 
     region = args.region or artefact["target_region"]
@@ -281,54 +403,57 @@ def main() -> int:
         target_dates = [start + timedelta(days=i)
                         for i in range((end - start).days + 1)]
 
-    print(f"[predict] region={region}  model_version={model_version}")
+    print(f"[predict] target={target.name}  region={region}  model_version={model_version}")
     print(f"[predict] first_trading_day={first_day}  n_dates={len(target_dates)}")
 
-    engine = get_engine()
-    feats = build_feature_frame(engine, target_dates, region, first_day)
-    X_df = filter_to_targets(feats, feature_cols, target_dates)
+    engine = get_engine(target)
+    try:
+        feats = build_feature_frame(engine, target, target_dates, region, first_day)
+        X_df = filter_to_targets(feats, feature_cols, target_dates)
 
-    if X_df.empty:
-        sys.exit(
-            "ERROR: no rows with complete features for the requested dates. "
-            "Either the dates are not yet ingested or D-1 / D-7 lookbacks "
-            "fall outside the data window."
-        )
+        if X_df.empty:
+            sys.exit(
+                "ERROR: no rows with complete features for the requested dates. "
+                "Either the dates are not yet ingested or D-1 / D-7 lookbacks "
+                "fall outside the data window."
+            )
 
-    n_dropped = len(target_dates) - len(X_df)
-    if n_dropped:
-        present = set(X_df["trading_day"].dt.date)
-        missing = sorted(set(target_dates) - present)
-        print(f"[predict] dropped {n_dropped} target dates with missing features: "
-              f"{missing}")
+        n_dropped = len(target_dates) - len(X_df)
+        if n_dropped:
+            present = set(X_df["trading_day"].dt.date)
+            missing = sorted(set(target_dates) - present)
+            print(f"[predict] dropped {n_dropped} target dates with missing features: "
+                  f"{missing}")
 
-    p = pipeline.predict_proba(X_df[feature_cols])[:, 1]
-    pred_label = (p >= 0.5).astype(int)
+        p = pipeline.predict_proba(X_df[feature_cols])[:, 1]
+        pred_label = (p >= 0.5).astype(int)
 
-    out = pd.DataFrame({
-        "predict_for_date": X_df["trading_day"].dt.date,
-        "regionid":         region,
-        "p_reversal":       p,
-        "predicted_label":  pred_label,
-        "model_version":    model_version,
-    })
+        out = pd.DataFrame({
+            "predict_for_date": X_df["trading_day"].dt.date,
+            "regionid":         region,
+            "p_reversal":       p,
+            "predicted_label":  pred_label,
+            "model_version":    model_version,
+        })
 
-    print("\n[predict] results")
-    print(out.to_string(index=False, float_format=lambda x: f"{x:.5f}"))
+        print("\n[predict] results")
+        print(out.to_string(index=False, float_format=lambda x: f"{x:.5f}"))
 
-    if args.dry_run:
-        print("\n[predict] --dry-run: skipping DB write")
-        return 0
+        if args.dry_run:
+            print("\n[predict] --dry-run: skipping DB write")
+            return 0
 
-    ts = datetime.utcnow()
-    rows = [
-        {"d": r.predict_for_date, "r": r.regionid,
-         "p": float(r.p_reversal), "lab": int(r.predicted_label),
-         "ver": r.model_version, "ts": ts}
-        for r in out.itertuples(index=False)
-    ]
-    write_predictions(engine, rows)
-    print(f"\n[predict] upserted {len(rows)} rows into analytics.predictions")
+        ts = datetime.utcnow()
+        rows = [
+            {"d": r.predict_for_date, "r": r.regionid,
+             "p": float(r.p_reversal), "lab": int(r.predicted_label),
+             "ver": r.model_version, "ts": ts}
+            for r in out.itertuples(index=False)
+        ]
+        write_predictions(engine, target, rows)
+        print(f"\n[predict] upserted {len(rows)} rows into {target.tbl_predictions}")
+    finally:
+        engine.dispose()
     return 0
 
 
