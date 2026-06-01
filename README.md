@@ -2,13 +2,14 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14-336791)
+![Snowflake](https://img.shields.io/badge/Snowflake-Cloud%20DW-29B5E8)
+![dbt](https://img.shields.io/badge/dbt-Snowflake-FF694A)
 ![Power BI](https://img.shields.io/badge/Power%20BI-Dashboard-F2C811)
-![Status](https://img.shields.io/badge/Phase%201-Complete-brightgreen)
-![Status](https://img.shields.io/badge/Phase%202-Partial%20(A%20%2B%20B)-yellow)
+![Streamlit](https://img.shields.io/badge/Streamlit-Live-FF4B4B)
 
 Quantifying how rooftop solar has flipped the NEM from max-demand-constrained to **min-demand-constrained** across all 5 regions over 44 months.
 
-Pipeline: Australian Energy Market Operator (AEMO) MMSDM + Open-Meteo Archive → PostgreSQL → analytics views → Python statistical notebooks + Power BI dashboard.
+Pipeline: AEMO NEMWeb CURRENT + Open-Meteo Archive → AWS S3 (raw zip + parsed parquet) → Snowpipe → Snowflake → dbt → predict.py inference → Streamlit Community Cloud public dashboard. Postgres + Power BI are retained for the original retrospective analysis layer.
 
 ---
 
@@ -116,21 +117,93 @@ Page 2 is a methodology + ML walkthrough — the Finding 4 partial-residual scat
 
 ---
 
-## Phase 2 — Operationalisation (in progress)
+## Live pipeline
 
-Phase 1 above is the frozen retrospective analysis. Phase 2 turns it into a forward-running daily inference loop — same model, same features, but consuming near-realtime NEMWeb data instead of MMSDM monthly archives.
+The retrospective findings above sit on top of a self-managing daily inference loop: NEMWeb CURRENT, AWS S3, Snowflake, Snowpipe, dbt, GitHub Actions, and Streamlit Community Cloud. The fitted leak-free LR pipeline is pickled once and reused — same model, same features, no nightly retraining. The analytics layer (raw → dbt views → features → predictions) refreshes nightly from the new day's NEMWeb data.
 
-**Delivered (workstreams A + B):**
+### Architecture
 
-- **`pipeline/predict.py`** — CLI inference (`python pipeline/predict.py --date YYYY-MM-DD`) that loads the Phase 1 leak-free LR pipeline from a joblib artefact and writes `P(D reversal)` to a Postgres `analytics.predictions` log. Replicates the notebook feature derivation (holiday flag, `time_idx`, lag-7 rooftop P95, semi-scheduled share) so the production output is bit-identical to the notebook's `predict_proba`.
-- **`pipeline/smoke_test_predict.py`** — replays the full NB02 test window through `predict.py` and asserts the realised AUC matches the artefact's pickled `test_auc` to within 1e-6. Currently passing with `gap = 0.00e+00`.
-- **`pipeline/fetch_aemo_current.py` + `pipeline/fetch_rooftop_current.py`** — NEMWeb CURRENT scrapers for daily incremental ingestion. The original Phase 2 plan assumed nemosis would route CURRENT URLs transparently for these tables — [it doesn't](docs/NEMWEB_CURRENT_SCHEMA_DIFF.md), so a custom scraper was needed. Both are idempotent via `ON CONFLICT DO NOTHING` on the existing primary keys; no schema migrations required.
-- **`db/03_predictions_schema.sql`** — `analytics.predictions` table (PK lets multiple `model_version`s coexist for A/B) + `v_prediction_vs_actual` reconciliation view.
-- **End-to-end verification** — predictions for 2026-05-13 and 2026-05-14 (the first dates produced from CURRENT data alone) both correctly flagged reversal=1 with high probability (P=0.89, 0.77); `hit=t` in the reconciliation view.
+```mermaid
+flowchart LR
+    NEMWEB[NEMWeb CURRENT<br/>5-min dispatch + 30-min rooftop]
+    OPEN[Open-Meteo Archive<br/>ERA5 daily weather]
+    CRON[GitHub Actions cron<br/>01:00 AEST daily]
+    S3RAW[S3<br/>raw zip backup]
+    S3PARQ[S3<br/>parsed parquet]
+    SQS[S3 event → SQS]
+    PIPE[Snowpipe ×3<br/>auto-ingest]
+    SFRAW[Snowflake NEM.RAW]
+    DBT[dbt-snowflake build<br/>11 models / 50 tests]
+    SFAN[Snowflake NEM.ANALYTICS]
+    PRED[predict.py<br/>--target snowflake]
+    SFPRED[Snowflake PREDICTIONS]
+    STREAM[Streamlit Community Cloud<br/>public dashboard]
+    PIPECHK[SYSTEM$PIPE_STATUS<br/>health check]
 
-**Deferred (workstreams C + D + E):**
+    NEMWEB -- fetch_*_current.py --> CRON
+    OPEN   -- fetch_open_meteo.py --> CRON
+    CRON --> S3RAW
+    CRON --> S3PARQ
+    S3PARQ --> SQS --> PIPE --> SFRAW
+    SFRAW --> DBT --> SFAN
+    SFAN --> PRED --> SFPRED
+    SFAN --> STREAM
+    SFPRED --> STREAM
+    PIPE --> PIPECHK --> CRON
+```
 
-GitHub Actions cron, AWS S3 raw backup, Snowflake + dbt port, and the public Streamlit dashboard are scoped but not yet executed. Decision context, restart checklist, and known issues are documented in [`docs/PHASE2_STATUS.md`](docs/PHASE2_STATUS.md). The pause is deliberate — Phase 2 A + B is the technical substance most relevant to a Junior DA portfolio; C + D + E target an Analytics Engineer / Senior DA audience and can resume when needed.
+### Component map
+
+| Layer | Stack |
+|---|---|
+| Ingest | NEMWeb CURRENT scraper (5-min dispatch + 30-min rooftop) + Open-Meteo Archive (daily weather) |
+| Object storage | AWS S3 (raw zip backup + parsed parquet) |
+| Warehouse | Snowflake (`NEM.RAW` + `NEM.ANALYTICS`); PostgreSQL retained as local dev SOT |
+| Transformation | dbt with both `dbt-postgres` and `dbt-snowflake` adapters (11 models, 50 schema tests) |
+| Ingestion trigger | Snowpipe auto-ingest via S3 event → SQS (~30 s lag) |
+| Orchestration | GitHub Actions cron at 01:00 AEST + `workflow_dispatch` |
+| Inference | `predict.py --target snowflake` in CI, `--target postgres` for local replay |
+| Monitoring | `pipeline/check_pipe_status.py` (`SYSTEM$PIPE_STATUS`) blocks CI if any pipe is stale > 26 h |
+| Dashboards | Power BI desktop file + Streamlit Community Cloud public URL |
+| Auth | AWS OIDC (no long-lived CI keys) + Snowflake password (GitHub / Streamlit Cloud secrets) |
+
+### Bit-identical model behaviour across DB targets
+
+The pickled leak-free LR pipeline and feature contract are the single source of truth. The smoke test replays the full held-out window from notebook 02 through `predict.py` against both DB targets and asserts the realised AUC matches the pickled value to within 1e-6:
+
+```
+$ python pipeline/smoke_test_predict.py --target postgres
+[smoke] AUC replay   = 0.754907
+[smoke] AUC artefact = 0.754907
+[smoke] |gap|        = 0.00e+00   tol=1e-06
+[smoke] PASS
+
+$ python pipeline/smoke_test_predict.py --target snowflake
+[smoke] AUC replay   = 0.754907
+[smoke] AUC artefact = 0.754907
+[smoke] |gap|        = 0.00e+00   tol=1e-06
+[smoke] PASS
+```
+
+Zero-bit drift, both targets. Postgres stays as the fast local dev SOT (no warehouse credits); Snowflake is the cloud production SOT.
+
+### Historical backfill, row-level parity
+
+The 2022-08 → 2026-05 window (1.97 M dispatch + 332 K rooftop + 6.98 K weather rows) was migrated from Postgres to Snowflake via `pipeline/backfill_to_snowflake.py` — 93 monthly parquet files (~120 MB total) dropped into S3 in 38 seconds, Snowpipe drained the queue in under 10 minutes, and per-source row counts match Postgres exactly:
+
+| Source | Postgres | Snowflake | Match |
+|---|---:|---:|:-:|
+| `region_5min` | 1,977,135 | 1,977,135 | ✓ |
+| `rooftop_pv_30min` | 332,710 | 332,710 | ✓ |
+| `weather_daily` | 6,980 | 6,980 | ✓ |
+
+### Cost
+
+Snowflake + S3 + SQS + GitHub Actions running this pipeline cost ≤ **~$3 / month** at steady state (XSMALL warehouse with 60-second auto-suspend, ~120 MB S3, Snowpipe serverless billing per file).
+
+### Operational runbook
+
+Cold-rebuild checklist, object inventory, known issues: [`docs/OPS_RUNBOOK.md`](docs/OPS_RUNBOOK.md).
 
 ---
 
@@ -163,6 +236,10 @@ Pulled in full from [`docs/METHODOLOGY.md § Caveats`](docs/METHODOLOGY.md#cavea
 
 ## Dataset
 
+The findings above are computed on a **frozen analysis window**. The cloud pipeline keeps the warehouse current beyond that window; the two are tracked separately so the reported coefficients stay reproducible while the live dashboard reflects fresh data.
+
+### Frozen analysis window (used for findings)
+
 | | |
 |---|---|
 | **Window** | 2022-08-01 → 2026-03-31 (44 months, 1,339 trading days) |
@@ -170,7 +247,16 @@ Pulled in full from [`docs/METHODOLOGY.md § Caveats`](docs/METHODOLOGY.md#cavea
 | **Dispatch** | AEMO MMSDM `DISPATCHREGIONSUM` ⨝ `DISPATCHPRICE`, INTERVENTION = 0 — ~1.93 M rows at 5-min |
 | **Rooftop PV** | AEMO MMSDM `ROOFTOP_PV_ACTUAL`, TYPE = MEASUREMENT — ~321 K rows at 30-min |
 | **Weather** | Open-Meteo Archive API (ERA5 reanalysis), 5 regional capitals, Australia/Brisbane tz — ~6.7 K rows daily |
-| **Storage** | PostgreSQL 14 (`raw.*` + `analytics.*` schemas) |
+
+### Live warehouse coverage (current pipeline state)
+
+| | |
+|---|---|
+| **Window** | 2022-08-01 → today (advances daily via the cron) |
+| **Dispatch** | ~1.97 M rows and growing |
+| **Rooftop PV** | ~333 K rows and growing |
+| **Weather** | ~7.0 K rows; ERA5 typically publishes within 1 day, so the cron's `--end` is `today − 1` and the workflow fails red on rare ERA5 stalls (D-1 weather is a model feature) |
+| **Storage** | AWS S3 (raw zip + parsed parquet) → Snowflake `NEM.RAW` / `NEM.ANALYTICS`; PostgreSQL retained as local dev SOT |
 
 Source license + attribution detail in [`docs/DATA_SOURCES.md`](docs/DATA_SOURCES.md).
 
@@ -180,61 +266,86 @@ Source license + attribution detail in [`docs/DATA_SOURCES.md`](docs/DATA_SOURCE
 
 ## Tech Stack
 
-- **Pipeline:** Python, pandas, nemosis (AEMO MMSDM archive), requests + BeautifulSoup (NEMWeb CURRENT scrape), SQLAlchemy
-- **Database:** PostgreSQL 14
+- **Ingest:** Python, pandas, nemosis (AEMO MMSDM archive), requests + BeautifulSoup (NEMWeb CURRENT scrape), pyarrow (parquet writer), boto3 (S3 upload)
+- **Storage:** AWS S3 (raw zip + parsed parquet), Snowflake (cloud DW), PostgreSQL 14 (local dev SOT)
+- **Transformation:** dbt-core with both `dbt-postgres` and `dbt-snowflake` adapters from a single model tree; custom cross-dialect macros for `BOOL_OR` / `FILTER (WHERE)` / `ARRAY_AGG WITHIN GROUP`
+- **Ingestion trigger:** Snowpipe with S3 event notification → SQS auto-ingest, `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE` COPY
+- **Orchestration:** GitHub Actions cron at 01:00 AEST + `workflow_dispatch`; AWS OIDC role assumption (no long-lived keys in CI)
+- **Monitoring:** `SYSTEM$PIPE_STATUS` health check fails the workflow if any pipe is stale > 26 h
 - **Analysis:** numpy, pandas, statsmodels (OLS + Newey-West HAC), scipy (Fisher, chi-square), scikit-learn (LR / RF / permutation importance), holidays
-- **Inference (Phase 2):** joblib model artefact + CLI inference; `psycopg2.extras.execute_values` for `ON CONFLICT DO NOTHING` upserts
-- **Dashboard:** Power BI Desktop, custom theme JSON
-- **Sources:** [AEMO MMSDM](https://aemo.com.au/) (historical) + [NEMWeb CURRENT](https://nemweb.com.au/Reports/Current/) (Phase 2 realtime), [Open-Meteo Archive](https://open-meteo.com/), [`holidays`](https://pypi.org/project/holidays/) Python package
+- **Inference:** joblib model artefact + dual-target `predict.py --target {postgres,snowflake}`; Postgres uses `ON CONFLICT`, Snowflake uses `MERGE`
+- **Dashboards:** Power BI Desktop (two-page findings report), Streamlit Community Cloud (live public URL)
+- **Sources:** [AEMO MMSDM](https://aemo.com.au/) + [NEMWeb CURRENT](https://nemweb.com.au/Reports/Current/) (live), [Open-Meteo Archive](https://open-meteo.com/), [`holidays`](https://pypi.org/project/holidays/) Python package
 
 ---
 
 ## Project Structure
 
 ```
-nem_negative_pricing/
+nem_demand_reversal/
 ├── pipeline/
-│   ├── _common.py              # KEEP_COLS / REVERSAL_HOURS + MMS parser / NaN→NULL helpers
-│   ├── fetch_aemo.py           # Dispatch MMSDM fetcher (Phase 1; idempotent, monthly chunked)
-│   ├── load_to_postgres.py     # Dispatch parquet → Postgres COPY
-│   ├── fetch_rooftop.py        # ROOFTOP_PV_ACTUAL MMSDM fetcher
-│   ├── load_rooftop.py         # Rooftop parquet → Postgres
-│   ├── fetch_open_meteo.py     # Open-Meteo Archive fetcher
-│   ├── load_weather.py         # Weather parquet → Postgres
-│   ├── export_for_powerbi.py   # Precompute FWL residuals + Fisher OR for PB
-│   ├── fetch_aemo_current.py   # Phase 2 — NEMWeb CURRENT 5-min dispatch scraper
-│   ├── fetch_rooftop_current.py# Phase 2 — NEMWeb CURRENT 30-min rooftop scraper
-│   ├── probe_nemweb_current.py # Phase 2 — read-only schema probe (dry-run)
-│   ├── predict.py              # Phase 2 — CLI inference (writes analytics.predictions)
-│   └── smoke_test_predict.py   # Phase 2 — regression test vs NB02 pickled test AUC
+│   ├── _common.py                  # MMS parser + S3 zip/parquet upload + NEMWeb retry adapter
+│   ├── fetch_aemo.py               # MMSDM dispatch backfill fetcher
+│   ├── load_to_postgres.py         # MMSDM dispatch parquet → Postgres
+│   ├── fetch_rooftop.py            # MMSDM rooftop backfill fetcher
+│   ├── load_rooftop.py             # MMSDM rooftop parquet → Postgres
+│   ├── fetch_open_meteo.py         # Open-Meteo Archive fetcher → local parquet + S3
+│   ├── load_weather.py             # Weather parquet → Postgres
+│   ├── export_for_powerbi.py       # Precompute FWL residuals + Fisher OR for PB report
+│   ├── fetch_aemo_current.py       # Daily NEMWeb CURRENT dispatch → Postgres + S3 zip/parquet
+│   ├── fetch_rooftop_current.py    # Daily NEMWeb CURRENT rooftop → Postgres + S3 zip/parquet
+│   ├── probe_nemweb_current.py     # Read-only NEMWeb CURRENT schema probe
+│   ├── backfill_to_snowflake.py    # One-shot Postgres → S3 parquet → Snowpipe migration
+│   ├── predict.py                  # Dual-target inference (--target postgres/snowflake)
+│   ├── smoke_test_predict.py       # Regression test vs notebook 02 AUC, both targets
+│   └── check_pipe_status.py        # Snowpipe health check (CI gate)
 ├── db/
-│   ├── 01_raw_schema.sql       # 3 raw tables (dispatch / rooftop / weather)
-│   ├── 02_analytics_views.sql  # 8 analytics views
-│   └── 03_predictions_schema.sql # Phase 2 — analytics.predictions + reconciliation view
-├── notebooks/
-│   ├── 01_descriptive.ipynb    # Findings 1–3 + sub-findings
-│   └── 02_reversal_classifier.ipynb  # Findings 4–8
-├── dashboard/
-│   ├── nem_reversal.pbix       # 2-page Power BI source
-│   ├── page1_findings.png
-│   ├── page2_methodology.png
-│   ├── theme.json              # Colour palette
-│   └── data/                   # Precomputed CSVs for PB
-├── figures/                    # 14 notebook-generated PNG outputs (10 embedded in this README)
+│   ├── 01_raw_schema.sql           # Postgres raw schema
+│   ├── 02_predictions_schema.sql   # Postgres analytics.predictions
+│   └── snowflake/                  # Snowflake setup runbook (numbered execution order)
+│       ├── 01_account_setup.sql    # WH + DB + schemas + role + grants
+│       ├── 02_storage_integration.sql  # S3_NEM integration (returns IAM principal + external ID)
+│       ├── 03_stage_and_test.sql   # External stage + LIST validation
+│       ├── 04_raw_schema.sql       # NEM.RAW.{REGION_5MIN,ROOFTOP_PV_30MIN,WEATHER_DAILY}
+│       ├── 05_file_format_and_pipes.sql  # Parquet file format + 3 Snowpipes (AUTO_INGEST)
+│       ├── 06_predictions_schema.sql  # NEM.ANALYTICS.PREDICTIONS
+│       └── aws/                    # IAM JSON + S3 event notification setup
+├── dbt/
+│   ├── dbt_project.yml
+│   ├── macros/cross_dialect.sql    # Postgres ↔ Snowflake macro helpers
+│   └── models/
+│       ├── staging/                # 3 raw → staging transforms
+│       ├── marts/                  # 6 reversal + demand-summary views
+│       └── ml/                     # v_ml_features + v_prediction_vs_actual
+├── .github/
+│   ├── workflows/daily.yml         # Daily cron: fetch → S3 → Snowpipe → dbt → predict → health check
+│   └── dbt-ci/profiles.yml         # CI-only dbt profile (env-var driven)
+├── .streamlit/
+│   ├── config.toml                 # Streamlit theme
+│   └── secrets.toml.example        # Snowflake creds template (real file gitignored)
+├── streamlit_app.py                # Live public dashboard (reversal rate + predictions + pipe health)
+├── notebooks/                      # Notebook 01 — descriptive findings; notebook 02 — ML benchmark
+├── dashboard/                      # Power BI source + theme
+├── figures/                        # 14 notebook-generated PNG outputs
 ├── docs/
-│   ├── METHODOLOGY.md          # Pre-registered hypotheses + verdicts
-│   ├── DATA_SOURCES.md         # AEMO / Open-Meteo attribution
-│   ├── PHASE2_STATUS.md        # Phase 2 — delivered / deferred / restart checklist
-│   └── NEMWEB_CURRENT_SCHEMA_DIFF.md # Phase 2 — schema diff CURRENT vs MMSDM
-├── models/                     # Phase 2 — joblib artefacts (gitignored; regenerable from NB02)
-├── environment.yml             # conda env spec
-├── .env.example                # Postgres connection template
+│   ├── METHODOLOGY.md              # Pre-registered hypotheses + verdicts
+│   ├── DATA_SOURCES.md             # AEMO / Open-Meteo attribution
+│   ├── OPS_RUNBOOK.md              # Object inventory + restart checklist + cost + known issues
+│   └── NEMWEB_CURRENT_SCHEMA_DIFF.md  # NEMWeb CURRENT vs MMSDM schema gotchas
+├── models/                         # leak_free_lr.joblib committed; other dumps gitignored
+├── environment.yml                 # conda env spec
+├── requirements.txt                # slim deps for Streamlit Cloud deploy
+├── .env.example                    # Postgres + S3 + Snowflake env template
 └── README.md
 ```
 
 ---
 
 ## Reproducing Locally
+
+### Local analytics (Postgres only)
+
+For local replay of the findings without touching cloud infra:
 
 ```bash
 # 1. Environment
@@ -245,20 +356,52 @@ cp .env.example .env                                # then fill DB_PWD
 # 2. Database schemas
 createdb -U postgres nem
 psql -U postgres -d nem -f db/01_raw_schema.sql
-psql -U postgres -d nem -f db/02_analytics_views.sql
+psql -U postgres -d nem -f db/02_predictions_schema.sql
 
 # 3. Ingest (idempotent — safe to re-run; ~30 min cold cache)
 python pipeline/fetch_aemo.py        && python pipeline/load_to_postgres.py
 python pipeline/fetch_rooftop.py     && python pipeline/load_rooftop.py
 python pipeline/fetch_open_meteo.py  && python pipeline/load_weather.py
 
-# 4. Precompute Power BI artefacts
+# 4. Analytics layer
+dbt build --project-dir dbt --target dev
+
+# 5. Precompute Power BI artefacts
 python pipeline/export_for_powerbi.py
 
-# 5. Run notebooks
+# 6. Notebooks
 jupyter lab notebooks/01_descriptive.ipynb
 jupyter lab notebooks/02_reversal_classifier.ipynb
 ```
+
+### Cloud stack (AWS + Snowflake)
+
+Setup is sequenced through `db/snowflake/` (numbered SQL files) + `db/snowflake/aws/` (IAM JSON). Full runbook: [`docs/OPS_RUNBOOK.md`](docs/OPS_RUNBOOK.md); abridged here:
+
+```bash
+# 1. AWS — S3 bucket + OIDC role for GitHub Actions + low-priv local user
+#    (see db/snowflake/aws/README.md)
+
+# 2. Snowflake account → run db/snowflake/01_*.sql through 06_*.sql in Snowsight
+
+# 3. ~/.dbt/profiles.yml — add `snowflake` output (template in OPS_RUNBOOK.md)
+
+# 4. Backfill Postgres → Snowflake (one-shot, ~10 min)
+python pipeline/backfill_to_snowflake.py
+
+# 5. Build analytics layer on Snowflake
+dbt build --project-dir dbt --target snowflake
+
+# 6. Smoke-test bit-identical model behaviour across targets
+python pipeline/smoke_test_predict.py --target postgres
+python pipeline/smoke_test_predict.py --target snowflake
+
+# 7. Streamlit dashboard
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # fill Snowflake password
+streamlit run streamlit_app.py
+```
+
+Step 4 (`backfill_to_snowflake.py`) is a one-shot historical migration — run once at bring-up, never on a schedule. The GitHub Actions cron (`.github/workflows/daily.yml`) runs the nightly loop: incremental NEMWeb fetch → S3 upload → Snowpipe ingest (60 s drain wait) → `dbt build --target snowflake` → `predict.py --target snowflake` → Snowpipe staleness gate. Step 6 (smoke tests) is a bring-up verification, not part of the nightly run.
 
 ---
 

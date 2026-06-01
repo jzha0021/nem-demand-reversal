@@ -1,8 +1,8 @@
-# NEMWeb CURRENT vs MMSDM Historical — Schema Diff (Workstream A1)
+# NEMWeb CURRENT vs MMSDM Historical — Schema Diff
 
 **Status:** finalised 2026-05-14. Captured from live NEMWeb CURRENT (DispatchIS report 15:40 AEST, MEASUREMENT rooftop 15:00 interval) using `pipeline/probe_nemweb_current.py`.
 
-**Purpose:** confirm that NEMWeb CURRENT publishes the same MMS schema we already ingest from MMSDM, so the daily inference cron can pull D-1 data from CURRENT without changing `db/01_raw_schema.sql`, `db/02_analytics_views.sql`, or any downstream model code.
+**Purpose:** confirm that NEMWeb CURRENT publishes the same MMS schema we already ingest from MMSDM, so the daily inference cron can pull D-1 data from CURRENT without changing `db/01_raw_schema.sql`, the `dbt/models/` analytics layer, or any downstream model code.
 
 ---
 
@@ -21,7 +21,7 @@
 
 ## 1. nemosis 3.8.1 does not route these tables through CURRENT
 
-`nemosis.dynamic_data_compiler` for `DISPATCHREGIONSUM`, `DISPATCHPRICE`, and `ROOFTOP_PV_ACTUAL` is hard-wired to `aemo_mms_url` (`Data_Archive/.../MMSDM_Historical_Data_SQLLoader/...`). CURRENT routing in nemosis exists only for 4 unrelated tables (`BIDDING`, `DAILY_REGION_SUMMARY`, `NEXT_DAY_DISPATCHLOAD`, `INTERMITTENT_GEN_SCADA`). The Phase 2 plan's "same nemosis package, different endpoints" assumption was wrong; CURRENT ingestion needs a custom scraper.
+`nemosis.dynamic_data_compiler` for `DISPATCHREGIONSUM`, `DISPATCHPRICE`, and `ROOFTOP_PV_ACTUAL` is hard-wired to `aemo_mms_url` (`Data_Archive/.../MMSDM_Historical_Data_SQLLoader/...`). CURRENT routing in nemosis exists only for 4 unrelated tables (`BIDDING`, `DAILY_REGION_SUMMARY`, `NEXT_DAY_DISPATCHLOAD`, `INTERMITTENT_GEN_SCADA`). The natural "same nemosis package, different endpoints" assumption was wrong; CURRENT ingestion needs a custom scraper.
 
 Evidence:
 - `nemosis/defaults.py:55,62,81` → `table_types[<our tables>] = "MMS"`
@@ -137,17 +137,17 @@ VIC1: 1502.095 MW
 
 ---
 
-## 4. Implications for Workstream A2 (production fetcher)
+## 4. Implications for the production fetcher
 
 | Decision | Choice |
 |---|---|
-| New file: `pipeline/fetch_aemo_current.py` | one HTTPS GET per 5-min interval, parse 2 tables out of 7, narrow to KEEP_COLS, write per-day parquet |
-| New file: `pipeline/fetch_rooftop_current.py` | filter filename to `_MEASUREMENT_`, one zip per 30-min interval, narrow to ROOFTOP_COLS, write per-day parquet |
-| Reuse `pipeline/load_to_postgres.py` / `load_rooftop.py` | yes — parquet schema unchanged |
+| New file: `pipeline/fetch_aemo_current.py` | one HTTPS GET per 5-min interval, parse 2 tables out of 7, narrow to KEEP_COLS, write rows into Postgres + S3 (raw zip + parsed parquet) |
+| New file: `pipeline/fetch_rooftop_current.py` | filter filename to `_MEASUREMENT_`, one zip per 30-min interval, narrow to ROOFTOP_COLS, same dual-target write |
+| Reuse `pipeline/load_to_postgres.py` / `load_rooftop.py` | not needed for CURRENT — `fetch_*_current.py` write to Postgres directly |
 | Reuse `db/01_raw_schema.sql` | yes — no migrations needed |
-| Reuse `db/02_analytics_views.sql` | yes |
-| `pipeline/_common.py` | extend with `parse_mms_multi_table()` helper; share between MMSDM + CURRENT |
-| Idempotency strategy | skip 5-min / 30-min zip if its parquet day-shard already covers that interval — same pattern as `fetch_aemo.py` |
+| Reuse `dbt/models/` analytics layer | yes — no model changes |
+| `pipeline/_common.py` | extend with `parse_mms_zip()` + `download_nemweb_zip()` helpers; share between MMSDM + CURRENT |
+| Idempotency strategy | `ON CONFLICT DO NOTHING` on Postgres; HEAD-then-PUT on S3; dbt staging dedupes Snowflake raw on (natural key, _INGESTED_AT) |
 | Backfill behaviour | CURRENT keeps ~2 days of dispatch + ~14 days of rooftop. Anything older must come from MMSDM (`fetch_aemo.py`). The two fetchers cover non-overlapping windows. |
 
 ---

@@ -1,12 +1,17 @@
 # Secrets
 .env
+.streamlit/secrets.toml
 
 # Data — too large for git, regenerable from nemosis / Open-Meteo
 data/raw/
 data/parquet/
 
-# ML artefacts — regenerable from notebooks/02_reversal_classifier.ipynb
+# ML artefacts — exception for the frozen leak-free LR artefact (3KB, the
+# single source of truth for predict.py; CI cannot run inference without it).
+# All other joblib files (notebook scratch dumps, retrain experiments) stay
+# ignored.
 models/*.joblib
+!models/leak_free_lr.joblib
 
 # Python
 __pycache__/
@@ -34,3 +39,6 @@ dbt/target/
 dbt/dbt_packages/
 dbt/logs/
 dbt/.user.yml
+
+# dbt also writes a logs/ at repo root when invoked from outside dbt/
+logs/

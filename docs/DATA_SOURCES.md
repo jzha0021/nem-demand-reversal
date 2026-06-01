@@ -64,14 +64,21 @@ References:
 
 ## ERA5 publication latency caveat
 
-Open-Meteo's archive endpoint backs onto ECMWF ERA5, which is typically
-published with a 5-day rolling latency. `pipeline/fetch_open_meteo.py`
-enforces a 99 %-coverage gate on the fetched window, so if a request
-includes the last few days it will fail loudly rather than silently
-ingest partial rows. For automated incremental pulls, call the fetcher
-with `end_date ≤ today − 7 days`. The dashboard window ends on
-2026-03-31, so this latency does not affect any analytical results
-in this repo.
+Open-Meteo's archive endpoint backs onto ECMWF ERA5, which has a
+nominal 5-day publication latency but in practice publishes within
+about 1 day of the trading day closing. `pipeline/fetch_open_meteo.py`
+defaults to `--end today − 1` to reflect that empirical lag —
+the freshness `predict.py` needs, since the live model uses D-1
+weather features (`prev_t_max_c`, `prev_solar_mj_m2`, etc.). The
+fetcher enforces a 99 %-coverage gate on the fetched window; on the
+rare days ERA5 lags further the gate trips and the fetcher exits
+non-zero so the daily cron fails red rather than silently dropping
+today's prediction inside `predict.py`'s `dropna()`. Operators
+running a historical catch-up that can tolerate staler weather pass
+`--max-walkback N` to opt in to walkback retries.
+
+The frozen analysis window (used for findings) ends on 2026-03-31,
+so latency does not affect any analytical results in this repo.
 
 ---
 
@@ -108,7 +115,7 @@ python pipeline/fetch_open_meteo.py
 python pipeline/load_weather.py
 
 # 4. Build analytics views on top
-psql -U postgres -d nem -f db/02_analytics_views.sql
+dbt build --project-dir dbt --target dev
 ```
 
 All three fetchers are idempotent (skip already-cached months / days) and

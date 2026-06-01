@@ -11,7 +11,7 @@ Background
 nemosis 3.8.1 routes DISPATCHREGIONSUM / DISPATCHPRICE / ROOFTOP_PV_ACTUAL
 exclusively through MMSDM_Historical_Data_SQLLoader URLs — i.e. monthly
 archives published ~10 days after month-end. Daily inference cron cannot
-wait that long, so Phase 2 needs a custom CURRENT scraper. This probe
+wait that long, so a custom CURRENT scraper is needed. This probe
 validates the URL paths and confirms that NEMWeb CURRENT publishes the
 same MMS schema (column names + ordering) as MMSDM, so the downstream
 schema + view layer requires zero changes.
