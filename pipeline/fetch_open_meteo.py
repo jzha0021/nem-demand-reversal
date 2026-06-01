@@ -69,7 +69,22 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
-from _common import WEATHER_COLS, s3_enabled, upload_parquet_to_s3
+from _common import WEATHER_COLS, make_nemweb_session, s3_enabled, upload_parquet_to_s3
+
+# Module-level retry-enabled session reused across all region fetches.
+# Open-Meteo Archive occasionally hands out a slow SSL handshake or a
+# 5xx; the urllib3 Retry adapter (5 attempts, exponential backoff,
+# status_forcelist covers 5xx + 429) auto-retries so transient upstream
+# blips don't fail the daily cron. The session is named "nemweb" by
+# the helper for historical reasons — the retry config is generic.
+_session = None
+
+
+def _get_session():
+    global _session
+    if _session is None:
+        _session = make_nemweb_session()
+    return _session
 
 # -----------------------------------------------------------------------------
 # Config
@@ -150,7 +165,7 @@ def _api_fetch(regionid: str, start: str, end: str) -> tuple[pd.DataFrame, float
     }
 
     t0 = time.time()
-    r = requests.get(ENDPOINT, params=params, timeout=60)
+    r = _get_session().get(ENDPOINT, params=params, timeout=60)
     r.raise_for_status()
     payload = r.json()
     download_s = time.time() - t0
