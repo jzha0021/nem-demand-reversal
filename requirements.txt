@@ -1,0 +1,11 @@
+# Streamlit Community Cloud installs from this file when the repo is
+# deployed at https://share.streamlit.io. It is a slim subset of
+# environment.yml — only what streamlit_app.py actually imports at run
+# time, so the deployment image stays small.
+
+streamlit>=1.40
+altair>=5
+pandas>=2,<3
+sqlalchemy>=2
+snowflake-sqlalchemy>=1.6
+snowflake-connector-python>=4

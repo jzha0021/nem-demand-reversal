@@ -1,0 +1,13 @@
+# Streamlit theme — matches dashboard/theme.json so the public URL and the
+# Power BI report share visual language.
+
+[theme]
+base                = "light"
+primaryColor        = "#1f77b4"
+backgroundColor     = "#ffffff"
+secondaryBackgroundColor = "#f5f7fa"
+textColor           = "#262730"
+font                = "sans serif"
+
+[server]
+headless = true
