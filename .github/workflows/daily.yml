@@ -110,10 +110,13 @@ jobs:
           python pipeline/fetch_open_meteo.py --start "$START"
 
       # ----------------------------------------------------------------
-      # Step 2: wait for Snowpipe to drain the parquet we just uploaded
+      # Step 2: poll Snowpipe until pendingFileCount == 0 (or 5 min
+      # timeout). Replaces a flat sleep — a too-short sleep raced with
+      # predict.py downstream and made it drop today's row in dropna()
+      # because D-1's parquet hadn't fully ingested.
       # ----------------------------------------------------------------
-      - name: Wait 60s for Snowpipe to ingest fresh parquet
-        run: sleep 60
+      - name: Wait for Snowpipe to drain
+        run: python pipeline/wait_for_snowpipe.py --timeout-seconds 300
 
       # ----------------------------------------------------------------
       # Step 3: rebuild analytics layer on Snowflake. dbt picks up the
