@@ -99,16 +99,19 @@ DEFAULT_START = "2022-08-01"
 
 
 def _default_end() -> str:
-    """Dynamic default for --end: today minus 1 day.
+    """Dynamic default for --end: today AEST minus 1 day.
 
-    Live inference needs D-1 weather features (model has prev_t_max_c
-    etc.), so the default targets the freshest end-date typically
-    available. ERA5's empirical lag is ~1 day; on rare days when it
-    lags further the 99 % coverage gate trips and the fetcher exits
-    non-zero unless the caller explicitly opts in to walkback via
-    --max-walkback N.
+    AEST-anchored (Australia/Brisbane, no DST) so behaviour is
+    identical on local dev machines and UTC CI runners. Plain
+    date.today() runs 10 h behind AEST on GitHub Actions, which
+    silently shifts end to D-2 around the 01:00 AEST cron — weather
+    for D-1 then never lands and predict.py drops the D row in
+    dropna() with the misleading "no rows with complete features"
+    exit.
     """
-    return (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    import datetime as _dt
+    today_aest = (_dt.datetime.utcnow() + _dt.timedelta(hours=10)).date()
+    return (today_aest - timedelta(days=1)).strftime("%Y-%m-%d")
 
 # Unified tz for all 5 regions so daily aggregation windows align with
 # NEM trading_day. See module docstring for rationale.
