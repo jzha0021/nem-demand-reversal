@@ -27,9 +27,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "pipeline"))
+from _common import get_snowflake_engine  # noqa: E402
+
 PIPES = [
     "NEM.RAW.NEM_PIPE_DISPATCH",
     "NEM.RAW.NEM_PIPE_ROOFTOP",
@@ -38,26 +41,8 @@ PIPES = [
 
 
 def get_engine():
-    from snowflake.sqlalchemy import URL
     load_dotenv(PROJECT_ROOT / ".env")
-    required = {
-        "account":  os.getenv("SNOWFLAKE_ACCOUNT"),
-        "user":     os.getenv("SNOWFLAKE_USER"),
-        "password": os.getenv("SNOWFLAKE_PASSWORD"),
-    }
-    missing = [k for k, v in required.items() if not v]
-    if missing:
-        sys.exit(f"ERROR: missing SNOWFLAKE_{'/'.join(m.upper() for m in missing)} "
-                 f"in env (.env or shell) — see .env.example for the contract")
-    return create_engine(URL(
-        account=required["account"],
-        user=required["user"],
-        password=required["password"],
-        role=os.getenv("SNOWFLAKE_ROLE", "R_NEM_RW"),
-        warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", "WH_NEM"),
-        database=os.getenv("SNOWFLAKE_DATABASE", "NEM"),
-        schema=os.getenv("SNOWFLAKE_SCHEMA", "RAW"),
-    ))
+    return get_snowflake_engine(schema="RAW")
 
 
 def main() -> int:

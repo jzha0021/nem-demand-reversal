@@ -167,7 +167,7 @@ flowchart LR
 | Inference | `predict.py --target snowflake` in CI, `--target postgres` for local replay |
 | Monitoring | `pipeline/check_pipe_status.py` (`SYSTEM$PIPE_STATUS`) blocks CI if any pipe is stale > 26 h |
 | Dashboards | Power BI desktop file + Streamlit Community Cloud public URL |
-| Auth | AWS OIDC (no long-lived CI keys) + Snowflake password (GitHub / Streamlit Cloud secrets) |
+| Auth | AWS OIDC (no long-lived CI keys) + Snowflake RSA key-pair on TYPE=SERVICE users (paid accounts force MFA on TYPE=PERSON) |
 
 ### Bit-identical model behaviour across DB targets
 
@@ -399,7 +399,7 @@ python pipeline/smoke_test_predict.py --target postgres
 python pipeline/smoke_test_predict.py --target snowflake
 
 # 7. Streamlit dashboard
-cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # fill Snowflake password
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # paste streamlit.p8 PEM body
 streamlit run streamlit_app.py
 ```
 

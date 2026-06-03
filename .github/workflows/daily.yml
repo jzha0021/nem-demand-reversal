@@ -38,7 +38,11 @@ jobs:
       S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
       SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      # RSA key-pair auth (paid Snowflake accounts force MFA on
+      # TYPE=PERSON, which a headless cron can't satisfy). Secret value
+      # is the raw multi-line PKCS8 PEM body; _common.get_snowflake_engine
+      # parses and DER-encodes it before passing to snowflake-connector.
+      SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
       SNOWFLAKE_ROLE: R_NEM_RW
       SNOWFLAKE_WAREHOUSE: WH_NEM
       SNOWFLAKE_DATABASE: NEM
@@ -58,11 +62,15 @@ jobs:
         # models/leak_free_lr.joblib was fit on; predict.py's
         # load_artefact() asserts an exact match and exits non-zero on
         # drift, so a silent upgrade would fail loud.
+        # cryptography is a transitive dep of snowflake-connector-python
+        # but we pin it explicitly so the key-pair auth path in
+        # _common.get_snowflake_engine can rely on it being present.
         run: |
           python -m pip install --upgrade pip
           pip install \
             boto3 requests beautifulsoup4 'pandas<3' tqdm python-dotenv \
             pyarrow holidays joblib 'scikit-learn==1.8.0' sqlalchemy \
+            cryptography \
             snowflake-connector-python snowflake-sqlalchemy \
             dbt-snowflake
 

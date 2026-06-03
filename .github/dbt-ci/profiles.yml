@@ -11,12 +11,16 @@ nem_demand:
   outputs:
     snowflake:
       type: snowflake
-      account:   "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
-      user:      "{{ env_var('SNOWFLAKE_USER') }}"
-      password:  "{{ env_var('SNOWFLAKE_PASSWORD') }}"
-      role:      "{{ env_var('SNOWFLAKE_ROLE') }}"
-      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
-      database:  "{{ env_var('SNOWFLAKE_DATABASE') }}"
-      schema:    ANALYTICS
+      account:     "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user:        "{{ env_var('SNOWFLAKE_USER') }}"
+      # Key-pair auth: dbt-snowflake accepts the raw PEM string under
+      # `private_key`. Paid Snowflake forces MFA on PERSON users; the CI
+      # secret SNOWFLAKE_PRIVATE_KEY points at a SERVICE-type user whose
+      # public-key fingerprint is registered via ALTER USER.
+      private_key: "{{ env_var('SNOWFLAKE_PRIVATE_KEY') }}"
+      role:        "{{ env_var('SNOWFLAKE_ROLE') }}"
+      warehouse:   "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database:    "{{ env_var('SNOWFLAKE_DATABASE') }}"
+      schema:      ANALYTICS
       threads: 4
       client_session_keep_alive: false

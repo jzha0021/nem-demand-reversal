@@ -18,11 +18,18 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+import sys
+from pathlib import Path
+
 import altair as alt
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine, text
-from snowflake.sqlalchemy import URL
+from sqlalchemy import text
+
+# Reuse the pipeline's key-pair auth helper so Streamlit + cron share one
+# engine factory (one source of truth for Snowflake connection semantics).
+sys.path.insert(0, str(Path(__file__).resolve().parent / "pipeline"))
+from _common import get_snowflake_engine  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Page config + theme
@@ -60,19 +67,27 @@ REGION_COLORS = {
 # ---------------------------------------------------------------------------
 @st.cache_resource(ttl=3600)
 def get_engine():
-    """Cached SQLAlchemy engine. Streamlit Cloud secrets supply the creds."""
+    """Cached SQLAlchemy engine. Streamlit Cloud secrets supply the creds.
+
+    Key-pair auth: ``private_key`` in secrets.toml is the raw PEM string
+    (multi-line triple-quoted). Account / user / role come from the same
+    [snowflake] section; we mirror them into os.environ so the shared
+    factory in _common.get_snowflake_engine() picks them up uniformly
+    across local cron, CI, and Streamlit.
+    """
+    import os as _os
     sf = st.secrets["snowflake"]
-    return create_engine(URL(
-        account=sf["account"],
-        user=sf["user"],
-        password=sf["password"],
-        # Streamlit ships least-privilege: R_NEM_READ has SELECT on
-        # analytics + raw + MONITOR on the 3 pipes, no CREATE / OPERATE.
-        role=sf.get("role", "R_NEM_READ"),
-        warehouse=sf.get("warehouse", "WH_NEM"),
-        database=sf.get("database", "NEM"),
+    _os.environ["SNOWFLAKE_ACCOUNT"]   = sf["account"]
+    _os.environ["SNOWFLAKE_USER"]      = sf["user"]
+    # Streamlit ships least-privilege: R_NEM_READ has SELECT on
+    # analytics + raw + MONITOR on the 3 pipes, no CREATE / OPERATE.
+    _os.environ["SNOWFLAKE_ROLE"]      = sf.get("role", "R_NEM_READ")
+    _os.environ["SNOWFLAKE_WAREHOUSE"] = sf.get("warehouse", "WH_NEM")
+    _os.environ["SNOWFLAKE_DATABASE"]  = sf.get("database", "NEM")
+    return get_snowflake_engine(
         schema=sf.get("schema", "ANALYTICS"),
-    ))
+        private_key_bytes=sf["private_key"].encode(),
+    )
 
 
 @st.cache_data(ttl=300)

@@ -113,28 +113,58 @@ ALTER USER <YOUR_SNOWFLAKE_ADMIN_USER> SET DEFAULT_WAREHOUSE = WH_NEM;
 ALTER USER <YOUR_SNOWFLAKE_ADMIN_USER> SET DEFAULT_NAMESPACE = NEM.RAW;
 
 -- ---------------------------------------------------------------------
--- 5) Dedicated Streamlit user — authenticates as STREAMLIT_DASHBOARD,
---    not the admin user. Even if the Streamlit Cloud secrets leak, the
---    attacker only gains R_NEM_READ (SELECT on analytics + raw, MONITOR
---    on pipes) — no CREATE, no OPERATE, no admin role.
+-- 5) Service users — RSA key-pair authentication.
 --
---    Password must be set via ALTER USER ... SET PASSWORD = '<value>'
---    in Snowsight (CREATE USER with literal password is allowed but
---    discouraged because the password ends up in query history).
+--    Paid Snowflake accounts force MFA on TYPE=PERSON users, so a
+--    headless pipeline / Streamlit cannot authenticate as the admin
+--    user above (which stays PERSON for Snowsight access). Two
+--    dedicated TYPE=SERVICE users — one RW for CI/cron, one READ for
+--    Streamlit — are isolated by role and authenticate via key-pair.
+--
+--    Generate two PKCS8 PEM key pairs locally before running this:
+--        openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM \
+--            -out nem_ci.p8 -nocrypt
+--        openssl rsa -in nem_ci.p8 -pubout -out nem_ci.pub
+--        (repeat with streamlit.p8 / streamlit.pub)
+--    The RSA_PUBLIC_KEY value is the body of the .pub file with the
+--    BEGIN/END headers stripped and the newlines removed (Snowflake
+--    accepts both single-line base64 and multi-line — newlines are
+--    fine inside the quoted string).
 -- ---------------------------------------------------------------------
+
+-- 5a) Pipeline / CI service user (RW)
+CREATE USER IF NOT EXISTS NEM_CI
+  TYPE              = SERVICE
+  DEFAULT_ROLE      = R_NEM_RW
+  DEFAULT_WAREHOUSE = WH_NEM
+  DEFAULT_NAMESPACE = NEM.RAW
+  COMMENT           = 'Headless cron / dbt / predict — key-pair auth, RW role';
+
+GRANT ROLE R_NEM_RW TO USER NEM_CI;
+
+-- 5b) Streamlit dashboard service user (READ-only)
 CREATE USER IF NOT EXISTS STREAMLIT_DASHBOARD
+  TYPE              = SERVICE
   DEFAULT_ROLE      = R_NEM_READ
   DEFAULT_WAREHOUSE = WH_NEM
   DEFAULT_NAMESPACE = NEM.ANALYTICS
-  COMMENT           = 'Public Streamlit dashboard — read-only, password set via ALTER USER';
+  COMMENT           = 'Public Streamlit dashboard — key-pair auth, read-only';
 
 GRANT ROLE R_NEM_READ TO USER STREAMLIT_DASHBOARD;
 
--- After running this file, in Snowsight (NOT here, to keep the password
--- out of query history):
---    ALTER USER STREAMLIT_DASHBOARD SET PASSWORD = '<strong random secret>';
--- Then paste the same value into the Streamlit Cloud deployment's
--- Secrets tab as [snowflake].password, with user = STREAMLIT_DASHBOARD.
+-- After running this file, register each user's public key in Snowsight
+-- (NOT here — keeps the key body out of the query history of the script).
+-- Snowflake's ALTER USER ... SET doesn't accept TYPE and RSA_PUBLIC_KEY
+-- in a single SET clause, so migrations from an existing PASSWORD user
+-- need two statements:
+--    -- New users (NEM_CI) are already TYPE=SERVICE from the CREATE above:
+--    ALTER USER NEM_CI            SET RSA_PUBLIC_KEY = '<body of nem_ci.pub>';
+--    -- Existing PERSON users (legacy STREAMLIT_DASHBOARD) migrate in two:
+--    ALTER USER STREAMLIT_DASHBOARD SET TYPE = SERVICE;
+--    ALTER USER STREAMLIT_DASHBOARD SET RSA_PUBLIC_KEY = '<body of streamlit.pub>';
+-- Local dev .env points SNOWFLAKE_PRIVATE_KEY_PATH at the matching .p8;
+-- CI / Streamlit Cloud paste the multi-line PEM directly into their
+-- secret stores (see .env.example + .streamlit/secrets.toml.example).
 
 -- ---------------------------------------------------------------------
 -- 6) Verify

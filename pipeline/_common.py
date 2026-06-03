@@ -386,3 +386,94 @@ def upload_parquet_to_s3(
 
     _get_s3_client().put_object(Bucket=bucket, Key=key, Body=body)
     return key, len(body)
+
+
+# ---------------------------------------------------------------------------
+# Snowflake engine factory — RSA key-pair auth
+# ---------------------------------------------------------------------------
+# Snowflake's 2025 paid-account policy enforces MFA on TYPE=PERSON users,
+# which a headless pipeline / Streamlit can't satisfy. TYPE=SERVICE users
+# bypass MFA but explicitly forbid password auth — only RSA key-pair (or
+# OAuth) works. This factory loads the PKCS8 private key and hands it to
+# snowflake-connector-python via connect_args.
+#
+# Key sourcing (first non-empty wins):
+#   1. private_key_bytes parameter   — Streamlit passes st.secrets bytes
+#   2. SNOWFLAKE_PRIVATE_KEY_PATH    — local dev (.env points at a .p8 file)
+#   3. SNOWFLAKE_PRIVATE_KEY         — CI / Streamlit Cloud (raw PEM string)
+#
+# Public key is registered once per user in Snowsight via
+#   ALTER USER <U> SET RSA_PUBLIC_KEY = '<base64 body, no PEM headers>';
+
+def get_snowflake_engine(
+    *,
+    schema: str | None = None,
+    private_key_bytes: bytes | None = None,
+):
+    """Return a SQLAlchemy engine for Snowflake using key-pair auth.
+
+    Parameters
+    ----------
+    schema
+        Default schema for the session. Falls back to env SNOWFLAKE_SCHEMA,
+        then to 'ANALYTICS'. Each caller can override per its needs (raw
+        ingest scripts want RAW; analytics queries want ANALYTICS).
+    private_key_bytes
+        Optional raw PEM bytes. Streamlit reads from ``st.secrets`` and
+        passes the value through here so it doesn't need env vars at all.
+    """
+    from snowflake.sqlalchemy import URL
+    from sqlalchemy import create_engine
+    from cryptography.hazmat.primitives import serialization
+
+    pem: bytes | None = private_key_bytes
+    if pem is None:
+        key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
+        key_raw  = os.getenv("SNOWFLAKE_PRIVATE_KEY")
+        if key_path:
+            with open(key_path, "rb") as f:
+                pem = f.read()
+        elif key_raw:
+            pem = key_raw.encode()
+        else:
+            import sys
+            sys.exit(
+                "ERROR: no Snowflake private key found. Set "
+                "SNOWFLAKE_PRIVATE_KEY_PATH (local file) or "
+                "SNOWFLAKE_PRIVATE_KEY (raw PEM) in env — see .env.example."
+            )
+
+    passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+    p_key = serialization.load_pem_private_key(
+        pem,
+        password=passphrase.encode() if passphrase else None,
+    )
+    pkb = p_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    required = {
+        "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+        "user":    os.getenv("SNOWFLAKE_USER"),
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        import sys
+        sys.exit(
+            f"ERROR: missing SNOWFLAKE_{'/'.join(m.upper() for m in missing)} "
+            f"in env — see .env.example for the contract"
+        )
+
+    return create_engine(
+        URL(
+            account=required["account"],
+            user=required["user"],
+            role=os.getenv("SNOWFLAKE_ROLE", "R_NEM_RW"),
+            warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", "WH_NEM"),
+            database=os.getenv("SNOWFLAKE_DATABASE", "NEM"),
+            schema=schema or os.getenv("SNOWFLAKE_SCHEMA", "ANALYTICS"),
+        ),
+        connect_args={"private_key": pkb},
+    )

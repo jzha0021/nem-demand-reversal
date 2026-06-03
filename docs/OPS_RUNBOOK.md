@@ -59,7 +59,7 @@ them in your own local notes / secrets manager.
 | Snowflake | Raw tables | `REGION_5MIN`, `ROOFTOP_PV_30MIN`, `WEATHER_DAILY` |
 | Snowflake | Analytics tables | `PREDICTIONS` + 11 dbt views |
 | GitHub | Workflow | `.github/workflows/daily.yml` |
-| GitHub | Secrets | `AWS_ROLE_ARN`, `AWS_S3_BUCKET`, `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD` |
+| GitHub | Secrets | `AWS_ROLE_ARN`, `AWS_S3_BUCKET`, `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PRIVATE_KEY` |
 | Streamlit | App | `streamlit_app.py` at repo root |
 
 ---
@@ -126,8 +126,13 @@ If the entire cloud side were lost, the rebuild order:
     `LIST @S3_NEM_STAGE` returns objects); run `04_raw_schema.sql`,
     `05_file_format_and_pipes.sql`, `06_predictions_schema.sql`.
 5.  **Local config** — edit `~/.dbt/profiles.yml` to add the `snowflake`
-    target (template below); `.env` gets `SNOWFLAKE_PASSWORD` for local
-    + Streamlit.
+    target (template below); generate an RSA-2048 PKCS8 key pair
+    (`openssl genrsa 2048 | openssl pkcs8 -topk8 -nocrypt -out nem_ci.p8`);
+    register the public-key body in Snowsight via
+    `ALTER USER NEM_CI SET RSA_PUBLIC_KEY = '<body>'`; point
+    `SNOWFLAKE_PRIVATE_KEY_PATH` in `.env` at the `.p8`. Paid Snowflake
+    accounts force MFA on TYPE=PERSON users — TYPE=SERVICE + key-pair
+    is the only headless-compatible auth.
 6.  **Backfill** — `python pipeline/backfill_to_snowflake.py` repopulates
     the raw layer.
 7.  **dbt build** — `dbt build --project-dir dbt --target snowflake`
@@ -135,8 +140,9 @@ If the entire cloud side were lost, the rebuild order:
 8.  **Smoke tests** — both `--target postgres` and `--target snowflake`
     must pass.
 9.  **GitHub repo Secrets** — set `AWS_ROLE_ARN`, `AWS_S3_BUCKET`,
-    `SNOWFLAKE_PASSWORD`; push `daily.yml`; trigger
-    `workflow_dispatch` once to confirm green.
+    `SNOWFLAKE_PRIVATE_KEY` (paste the multi-line PEM contents of the
+    `.p8` file, including the BEGIN/END lines); push `daily.yml`;
+    trigger `workflow_dispatch` once to confirm green.
 10. **Streamlit Cloud** — connect repo at share.streamlit.io; paste
     Snowflake creds into the deployment's Secrets tab; deploy.
 
@@ -161,13 +167,14 @@ nem_demand:
 
     snowflake:
       type: snowflake
-      account:   "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
-      user:      "{{ env_var('SNOWFLAKE_USER') }}"
-      password:  "{{ env_var('SNOWFLAKE_PASSWORD') }}"
-      role:      R_NEM_RW
-      warehouse: WH_NEM
-      database:  NEM
-      schema:    ANALYTICS
+      account:     "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user:        "{{ env_var('SNOWFLAKE_USER') }}"
+      # Local dev uses the file path; CI passes the PEM body inline.
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      role:        R_NEM_RW
+      warehouse:   WH_NEM
+      database:    NEM
+      schema:      ANALYTICS
       threads: 4
       client_session_keep_alive: false
 ```

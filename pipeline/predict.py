@@ -90,7 +90,7 @@ def get_engine(target: DBTarget):
     """Return a SQLAlchemy engine. Both Postgres and Snowflake go through
     SQLAlchemy so callers can use a single ``:name`` paramstyle (and the
     same ``pd.read_sql(text(sql), engine, params=...)`` invocation) across
-    targets. Snowflake uses snowflake-sqlalchemy.
+    targets. Snowflake uses snowflake-sqlalchemy with key-pair auth.
     """
     from sqlalchemy import create_engine
     load_dotenv(PROJECT_ROOT / ".env")
@@ -106,29 +106,11 @@ def get_engine(target: DBTarget):
         return create_engine(f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{name}")
 
     if target.name == "snowflake":
-        from snowflake.sqlalchemy import URL
-        # All Snowflake connection details come from env vars (loaded
-        # from .env locally; from GitHub Actions secrets in CI). No
-        # deployment-specific defaults baked into the code, so this
-        # repo is portable across operators.
-        required = {
-            "account":  os.getenv("SNOWFLAKE_ACCOUNT"),
-            "user":     os.getenv("SNOWFLAKE_USER"),
-            "password": os.getenv("SNOWFLAKE_PASSWORD"),
-        }
-        missing = [k for k, v in required.items() if not v]
-        if missing:
-            sys.exit(f"ERROR: missing SNOWFLAKE_{'/'.join(m.upper() for m in missing)} "
-                     f"in env (.env or shell) — see .env.example for the contract")
-        return create_engine(URL(
-            account=required["account"],
-            user=required["user"],
-            password=required["password"],
-            role=os.getenv("SNOWFLAKE_ROLE", "R_NEM_RW"),
-            warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", "WH_NEM"),
-            database=os.getenv("SNOWFLAKE_DATABASE", "NEM"),
-            schema=os.getenv("SNOWFLAKE_SCHEMA", "ANALYTICS"),
-        ))
+        # Late import so smoke tests that only touch Postgres don't pull
+        # the snowflake-sqlalchemy / cryptography stack onto the path.
+        sys.path.insert(0, str(PROJECT_ROOT / "pipeline"))
+        from _common import get_snowflake_engine
+        return get_snowflake_engine(schema="ANALYTICS")
 
     sys.exit(f"ERROR: unknown DB target {target.name!r}")
 
