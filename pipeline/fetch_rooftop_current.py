@@ -298,10 +298,28 @@ def main() -> int:
     if use_parquet and parquet_key:
         print(f"S3 parquet: s3://{os.getenv('S3_BUCKET')}/{parquet_key}  "
               f"({parquet_bytes:,} bytes)")
+    # Trailing-edge 404 tolerance: NEMWeb CURRENT's rolling retention
+    # (~14 days for rooftop) drops zips mid-run on the oldest end. Treat
+    # low-rate 404s as warnings; fatal anything else (or 404 rate > 1 %).
+    fatal = [(u, e) for u, e in failed
+             if "404 Client Error" not in e]
+    edge_404 = [(u, e) for u, e in failed
+                if "404 Client Error" in e]
+    edge_threshold = max(1, len(zips) // 100)
+
     if failed:
+        print("\nFailed zips (first 5):")
         for u, e in failed[:5]:
             print(f"  {u.rsplit('/', 1)[-1]}: {e}")
+    if fatal:
         return 1
+    if len(edge_404) > edge_threshold:
+        print(f"\n{len(edge_404)} 404s exceed trailing-edge tolerance "
+              f"({edge_threshold}) — failing.")
+        return 1
+    if edge_404:
+        print(f"\nNote: {len(edge_404)} 404(s) on trailing-edge zips treated "
+              f"as expected retention churn — exit 0.")
     return 0
 
 
